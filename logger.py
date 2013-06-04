@@ -7,6 +7,8 @@ class LogRotate(Thread):
 	def __init__(self, logger):
 		self.logger=logger
 		Thread.__init__(self)
+		self.daemon=True
+		self.start()
 	def run(self):
 		Y, M, D, h, m, s, w, d, dst=time.localtime()
 		nextrotate=int(time.mktime((Y, M, D+1, 0, 0, 0, 0, 0, -1)))
@@ -15,7 +17,7 @@ class LogRotate(Thread):
 		while True:
 			#print "LogRotate will sleep until %d/%d/%d %d:%02d:%02d"%(time.localtime(nextrotate)[:6])
 			while nextrotate>time.time(): ### May need to do this in a loop in case the following time.sleep command wakes up a second too early.
-				time.sleep(max(0.25, nextrotate-time.time()))
+				time.sleep(max(0.1, min((nextrotate-time.time(), 3600))))
 			self.logger.rotatelock.acquire()
 			if all([not log or log.closed for log in self.logger.consolelogs.values()+self.logger.channellogs.values()]):
 				### If there are no logs to rotate
@@ -26,19 +28,21 @@ class LogRotate(Thread):
 			#print "Rotating Logs"
 			now=time.localtime()
 			timestamp=reduce(lambda x,y: x+":"+y,[str(t).rjust(2,"0") for t in now[0:6]])
-			for network in self.logger.labels.keys():
-				#network.loglock.acquire()
-				if network.connected:
-					network.lock.acquire()
-					self.logger.rotateConsoleLog(network)
-					if network.identity:
-						for channel in network.identity.channels:
-							self.logger.rotateChannelLog(channel)
-					network.lock.release()
+			for IRC in self.logger.labels.keys():
+				#IRC.loglock.acquire()
+				if IRC.connected:
+					IRC.lock.acquire()
+					try:
+						self.logger.rotateConsoleLog(IRC)
+						if IRC.identity:
+							for channel in IRC.identity.channels:
+								self.logger.rotateChannelLog(channel)
+					finally:
+						IRC.lock.release()
 			nextrotate+=3600*24
 
 class Logger(object):
-	def __init__(self, logroot, **networks):
+	def __init__(self, logroot):
 		self.logroot=logroot
 		path=[logroot]
 		#print path
@@ -55,66 +59,84 @@ class Logger(object):
 		#return
 		self.consolelogs={}
 		self.channellogs={}
-		self.networks=networks
 		self.labels={}
-		for (label,network) in networks.items():
-			if not os.path.isdir(os.path.join(self.logroot, label)):
-				os.mkdir(os.path.join(self.logroot, label))
-			if network in self.labels.keys():
-				raise BaseException, "Network already exists"
-			self.labels[network]=label
-			network.lock.acquire()
-			network.modules.append(self)
-			network.lock.release()
 		self.rotatelock=Lock()
 		self.logrotate=None
-	def addNetworks(self, **networks):
-		for (label,network) in networks.items():
+	def addNetworks(self, **IRCs): ### Deprecated
+		for (label,IRC) in IRCs.items():
 			if not os.path.isdir(os.path.join(self.logroot, label)):
 				os.mkdir(os.path.join(self.logroot, label))
 			if label in self.labels.values():
 				raise BaseException, "Label already exists"
-			if network in self.networks.keys():
+			if IRC in self.IRCs.keys():
 				raise BaseException, "Network already exists"
-		for (label,network) in networks.items():
-			self.labels[network]=label
-			network.lock.acquire()
-			network.modules.append(self)
-			if network.connected:
-				openConsoleLog(network)
-			network.lock.release()
-	def removeNetworks(self, *networks):
-		for network in networks:
-			if network not in self.networks.keys():
+		for (label,IRC) in IRCs.items():
+			self.labels[IRC]=label
+			IRC.lock.acquire()
+			IRC.modules.append(self)
+			if IRC.connected:
+				self.openConsoleLog(IRC)
+			IRC.lock.release()
+	def removeNetworks(self, *IRCs): ### Deprecated
+		for IRC in IRCs:
+			if IRC not in self.IRCs.keys():
 				raise BaseException, "Network not added"
-		for network in networks:
-			network.lock.acquire()
-			network.modules.append(self)
-			if network.connected:
-				closeConsoleLog(network)
-			network.lock.release()
-			del self.labels[network]
-			del self.consolelogs[network]
-	def openConsoleLog(self, network):
+		for IRC in IRCs:
+			IRC.lock.acquire()
+			IRC.modules.append(self)
+			if IRC.connected:
+				self.closeConsoleLog(IRC)
+			IRC.lock.release()
+			del self.labels[IRC]
+			del self.consolelogs[IRC]
+
+	def onModuleAdd(self, IRC, label):
+		if label in self.labels.values():
+			raise BaseException, "Label already exists"
+		if IRC in self.labels.keys():
+			raise BaseException, "Network already exists"
+		if not os.path.isdir(os.path.join(self.logroot, label)):
+			os.mkdir(os.path.join(self.logroot, label))
+		IRC.lock.acquire()
+		self.labels[IRC]=label
+		if IRC.connected:
+			self.openConsoleLog(IRC)
+			if IRC.identity:
+				for channel in IRC.identity.channels:
+					self.openChannelLog(channel)
+		IRC.lock.release()
+
+	def onModuleRem(self, IRC):
+		IRC.lock.acquire()
+		if IRC.connected:
+			for channel in self.channellogs.keys():
+				if channel in IRC.channels:
+					if not self.channellogs[channel].closed: self.closeChannelLog(channel)
+					del self.channellogs[channel]
+			if not self.consolelogs[IRC].closed: self.closeConsoleLog(IRC)
+		IRC.lock.release()
+		del self.labels[IRC]
+		del self.consolelogs[IRC]
+
+	def openConsoleLog(self, IRC):
 		self.rotatelock.acquire()
 		if not self.logrotate or not self.logrotate.isAlive():
 			self.logrotate=LogRotate(self)
-			self.logrotate.daemon=True
-			self.logrotate.start()
 		self.rotatelock.release()
 		now=time.localtime()
 		timestamp=reduce(lambda x,y: x+":"+y,[str(t).rjust(2,"0") for t in now[0:6]])
-		self.consolelogs[network]=open(os.path.join(self.logroot, self.labels[network], "console-%04d.%02d.%02d.log"%now[:3]), "a")
-		print >>self.consolelogs[network], "%s %s ### Log session started" % (timestamp, time.tzname[now[-1]])
-		self.consolelogs[network].flush()
-	def closeConsoleLog(self, network):
-		now=time.localtime()
-		timestamp=reduce(lambda x,y: x+":"+y,[str(t).rjust(2,"0") for t in now[0:6]])
-		print >>self.consolelogs[network], "%s %s ### Log session ended" % (timestamp, time.tzname[now[-1]])
-		self.consolelogs[network].close()
-	def rotateConsoleLog(self, network):
-		self.closeConsoleLog(network)
-		self.openConsoleLog(network)
+		self.consolelogs[IRC]=open(os.path.join(self.logroot, self.labels[IRC], "console-%04d.%02d.%02d.log"%now[:3]), "a")
+		print >>self.consolelogs[IRC], "%s %s ### Log session started" % (timestamp, time.tzname[now[-1]])
+		self.consolelogs[IRC].flush()
+	def closeConsoleLog(self, IRC):
+		if IRC in self.consolelogs.keys() and type(self.consolelogs[IRC])==file and not self.consolelogs[IRC].closed:
+			now=time.localtime()
+			timestamp=reduce(lambda x,y: x+":"+y,[str(t).rjust(2,"0") for t in now[0:6]])
+			print >>self.consolelogs[IRC], "%s %s ### Log session ended" % (timestamp, time.tzname[now[-1]])
+			self.consolelogs[IRC].close()
+	def rotateConsoleLog(self, IRC):
+		self.closeConsoleLog(IRC)
+		self.openConsoleLog(IRC)
 
 	def openChannelLog(self, channel):
 		self.rotatelock.acquire()
@@ -151,10 +173,11 @@ class Logger(object):
 			if channel.created: print >>self.channellogs[channel], "%s %s <<< :%s 329 %s %s %s" % (timestamp, time.tzname[now[-1]], channel.context.serv, channel.context.identity.nick, channel.name, channel.created)
 		self.channellogs[channel].flush()
 	def closeChannelLog(self, channel):
-		now=time.localtime()
-		timestamp=reduce(lambda x,y: x+":"+y,[str(t).rjust(2,"0") for t in now[0:6]])
-		print >>self.channellogs[channel], "%s %s ### Log session ended" % (timestamp, time.tzname[now[-1]])
-		self.channellogs[channel].close()
+		if channel in self.channellogs.keys() and type(self.channellogs[channel])==file and not self.channellogs[channel].closed:
+			now=time.localtime()
+			timestamp=reduce(lambda x,y: x+":"+y,[str(t).rjust(2,"0") for t in now[0:6]])
+			print >>self.channellogs[channel], "%s %s ### Log session ended" % (timestamp, time.tzname[now[-1]])
+			self.channellogs[channel].close()
 	def rotateChannelLog(self, channel):
 		self.closeChannelLog(channel)
 		self.openChannelLog(channel)
