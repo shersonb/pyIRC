@@ -2,11 +2,12 @@
 import os, re, time
 
 class SED(object):
-	def __init__(self):
+	def __init__(self, expiry=1800):
 		self.__name__="SED Bot"
 		self.__version__="0.0.1"
+		self.expiry=expiry
 		self.history=[]
-		self.pattern=r"^!s([,/#])((?:.|\\\1)*)\1((?:.|\\\1)*)\1([ig]*)$"
+		self.pattern=r"^!?s([,/#])((?:.|\\\1)*)\1((?:.|\\\1)*)\1([ig]*)$"
 	def onRecv(self, IRC, line, data):
 		if data==None: return
 		self.replace(IRC, *data)
@@ -14,8 +15,11 @@ class SED(object):
 		if origin==self: return
 		#print data
 		(cmd, target, params, extinfo)=data
-		self.replace(IRC, IRC.identity.nick, IRC.identity.idnt, IRC.identity.host, *data)
+		if IRC.identity: self.replace(IRC, IRC.identity.nick, IRC.identity.idnt, IRC.identity.host, *data)
 	def replace(self, IRC, origin, ident, host, cmd, target, params, extinfo):
+		### Clear out old data that has expired.
+		while len(self.history) and self.history[0][0]<time.time()-self.expiry:
+			del self.history[0]
 		if len(target) and target[0]=="#" and cmd=="PRIVMSG":
 			target=IRC.channel(target)
 			matches=re.findall(self.pattern,extinfo)
@@ -57,8 +61,4 @@ class SED(object):
 				if not match:
 					target.msg("%s: I tried. I really tried! But I could not find the pattern: %s" % (origin, find), origin=self)
 			else:
-				#print "History",(origin, ident, host, cmd, target, params, extinfo)
 				self.history.append((time.time(), IRC, (origin, ident, host, cmd, target, params, extinfo)))
-				#print self.history
-		while len(self.history) and self.history[0][0]<time.time()-1800: del self.history[0]
-		#print self.history
