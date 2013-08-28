@@ -3,7 +3,7 @@ from threading import Thread, Event, Lock
 import re, time, sys, string, socket, os, platform, traceback, Queue, ssl
 
 class Connection(Thread):
-	def __init__(self, nick="ircbot", ident="python", realname="Python IRC Library", passwd=None, server="", port=None, ipv6=False, ssl=False, autoreconnect=True, log=sys.stderr, timeout=300, retrysleep=5, maxretries=15, onlogin=None):
+	def __init__(self, server, nick="ircbot", ident="python", realname="Python IRC Library", passwd=None, port=None, ipv6=False, ssl=False, autoreconnect=True, log=sys.stderr, timeout=300, retrysleep=5, maxretries=15, onlogin=None):
 		self.__name__="pyIRC"
 		self.__version__="1.0.0rc2"
 		self.__author__="Brian Sherson"
@@ -38,6 +38,7 @@ class Connection(Thread):
 		self.log=log
 
 		self.modules=[]
+		self.trusted=[]
 
 
 		### Initialize IRC environment variables
