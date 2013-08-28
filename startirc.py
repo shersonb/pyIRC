@@ -35,7 +35,7 @@ def sigterm(signum, frame):
 
 signal.signal(signal.SIGTERM, sigterm)
 
-logroot=os.path.join(os.environ["HOME"], "IRC/PyIRC")
+logroot=os.path.join(os.environ["HOME"], "IRC")
 
 insomnialog=open(os.path.join(logroot, "insomnia.log"), "a")
 InsomniaIRC=networks["InsomniaIRC"]=irc.Connection(server="irc.insomniairc.net", ipv6=False, ssl=True, log=insomnialog)
