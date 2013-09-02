@@ -152,6 +152,13 @@ class Connection(Thread):
                             else:
                                 self.connection = socket.socket(socket.AF_INET6 if self.ipv6 else socket.AF_INET, socket.SOCK_STREAM)
                             self.connection.connect((self.server, self.port, 0, 0) if self.ipv6 else (self.server, self.port))
+                        except socket.error:
+                            with self.loglock:
+                                exc, excmsg, tb = sys.exc_info()
+                                timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                                print >>self.log, "%(timestamp)s *** Connection to %(server)s:%(port)s failed: %(excmsg)s." % vars()
+                                self.log.flush()
+                        else:
                             self.connected = True
                             self.connection.settimeout(self.timeout)
 
@@ -172,17 +179,13 @@ class Connection(Thread):
                                 print >>self.log, "%(timestamp)s *** Connection to %(server)s:%(port)s established." % vars()
                                 self.log.flush()
                             break
-                        except socket.error:
-                            with self.loglock:
-                                exc, excmsg, tb = sys.exc_info()
-                                timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
-                                print >>self.log, "%(timestamp)s *** Connection to %(server)s:%(port)s failed: %(excmsg)s." % vars()
-                                self.log.flush()
 
                     if self.quitexpected:
                         sys.exit()
                     if attempt < self.maxretries or self.maxretries == -1:
                         time.sleep(self.retrysleep)
+                        if self.quitexpected:
+                            sys.exit()
                         attempt += 1
                     else:
                         with self.loglock:

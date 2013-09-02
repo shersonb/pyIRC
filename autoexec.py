@@ -76,7 +76,7 @@ class NickServ(object):
             return
         (origin, ident, host, cmd, target, params, extinfo) = data
         label, wallet, autojoin = self.networks[IRC]
-        if target == IRC.identity.nick and origin == "NickServ" and re.match("This nickname is registered and protected.", extinfo) and wallet and "%s/NickServ/%s"%(label, target.lower()) in wallet.keys():
+        if target == IRC.identity.nick and origin == "NickServ" and re.match("This nickname is registered( and protected)?.", extinfo) and wallet and "%s/NickServ/%s"%(label, target.lower()) in wallet.keys():
             IRC.user("NickServ").msg("identify %s" % wallet[
                 "%s/NickServ/%s"%(label, target.lower())])
         if cmd == "900" and autojoin:

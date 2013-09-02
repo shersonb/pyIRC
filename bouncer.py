@@ -13,7 +13,7 @@ import Queue
 
 
 class Bouncer (Thread):
-    def __init__(self, addr="", port=16667, ssl=False, certfile=None, keyfile=None, ignore=None, debug=False, log=sys.stderr):
+    def __init__(self, addr="", port=16667, ssl=False, certfile=None, keyfile=None, ignore=None, debug=False, log=sys.stderr, timeout=300):
         self.__name__ = "Bouncer for pyIRC"
         self.__version__ = "1.0.0rc2"
         self.__author__ = "Brian Sherson"
@@ -32,6 +32,7 @@ class Bouncer (Thread):
         self.connections = []
         self.ignore = ignore
         self.debug = debug
+        self.timeout = timeout
 
         ### Keep track of what extensions/connections are requesting WHO, WHOIS, and LIST, because we don't want to spam every bouncer connection with the server's replies.
         ### In the future, MAY implement this idea in the irc module.
@@ -67,7 +68,9 @@ class Bouncer (Thread):
                 self.socket.close()
                 #raise
                 sys.exit()
-            bouncer = BouncerConnection(self, connection, addr)
+            connection.settimeout(self.timeout)
+            bouncer = BouncerConnection(
+                self, connection, addr, debug=self.debug)
             #bouncer.daemon=True
             #self.connections.append(bouncer)
             #bouncer.start()
@@ -87,7 +90,7 @@ class Bouncer (Thread):
                     cmd = int(cmd)  # Code is a numerical response
                 if cmd in (352, 315, 304) or (cmd == 461 and params.upper() == "WHO"):  # WHO reply
                     if len(self.whoexpected[IRC]) and self.whoexpected[IRC][0] in self.connections:
-                        self.whoexpected[IRC][0].connection.send(line+"\n")
+                        self.whoexpected[IRC][0].send(line+"\n")
                     if cmd == 315 or (cmd == 461 and params.upper() == "WHO"):  # End of WHO reply
                         origin = self.whoexpected[IRC][0]
                         del self.whoexpected[IRC][0]
@@ -108,12 +111,12 @@ class Bouncer (Thread):
                                 IRC.log.flush()
                 elif cmd in (307, 311, 312, 313, 317, 318, 319, 330, 335, 336, 378, 379):  # WHO reply
                     if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-                        self.whoisexpected[IRC][0].connection.send(line+"\n")
+                        self.whoisexpected[IRC][0].send(line+"\n")
                     if cmd == 318:  # End of WHOIS reply
                         del self.whoisexpected[IRC][0]
                 elif cmd in (321, 322, 323):  # LIST reply
                     if len(self.listexpected[IRC]) and self.listexpected[IRC][0] in self.connections:
-                        self.listexpected[IRC][0].connection.send(line+"\n")
+                        self.listexpected[IRC][0].send(line+"\n")
                     if cmd == 323:  # End of LIST reply
                         del self.listexpected[IRC][0]
                 else:
@@ -122,15 +125,7 @@ class Bouncer (Thread):
                         #print IRC
                         #print line
                         if bouncer.IRC == IRC:
-                            try:
-                                bouncer.connection.send(line+"\n")
-                            except socket.error:
-                                with IRC.loglock:
-                                    exc, excmsg, tb = sys.exc_info()
-                                    print >>IRC.log, "%(timestamp)s !!! [Bouncer.onRecv] Exception in module %(module)s" % vars()
-                                    for tbline in traceback.format_exc().split("\n"):
-                                        print >>IRC.log, "%(timestamp)s !!! [Bouncer.onRecv] %(tbline)s" % vars()
-                                    IRC.log.flush()
+                            bouncer.send(line+"\n")
 
     def onSend(self, IRC, line, data, origin):
         if type(self.ignore) not in (list, tuple) or all([not re.match(pattern, line) for pattern in self.ignore]):
@@ -145,10 +140,10 @@ class Bouncer (Thread):
                         if ctcp:
                             (ctcptype, ext) = ctcp[0]
                             if ctcptype == "ACTION":
-                                bouncerconnection.connection.send(":%s!%s@%s %s\n" % (bouncerconnection.IRC.identity.nick, bouncerconnection.IRC.identity.idnt, bouncerconnection.IRC.identity.host, line))
+                                bouncerconnection.send(":%s!%s@%s %s\n" % (bouncerconnection.IRC.identity.nick, bouncerconnection.IRC.identity.idnt, bouncerconnection.IRC.identity.host, line))
                             ### Unless the message is a CTCP that is not ACTION.
                         else:
-                            bouncerconnection.connection.send(":%s!%s@%s %s\n" % (bouncerconnection.IRC.identity.nick, bouncerconnection.IRC.identity.idnt, bouncerconnection.IRC.identity.host, line))
+                            bouncerconnection.send(":%s!%s@%s %s\n" % (bouncerconnection.IRC.identity.nick, bouncerconnection.IRC.identity.idnt, bouncerconnection.IRC.identity.host, line))
             elif cmd.upper() == "WHO":
                 self.whoexpected[IRC].append(origin)
                 if self.debug:
@@ -196,8 +191,6 @@ class Bouncer (Thread):
                 del self.servers[label]
 
     def stop(self):
-        #self.quitmsg=quitmsg
-        #self.connection.send("ERROR :Closing link: (%s@%s) [%s]\n" % (self.IRC.identity.nick, self.addr[0], self.quitmsg))
         self.socket.shutdown(0)
 
     def disconnectall(self, quitmsg="Disconnecting all sessions"):
@@ -220,7 +213,7 @@ class Bouncer (Thread):
 
 
 class BouncerConnection (Thread):
-    def __init__(self, bouncer, connection, addr):
+    def __init__(self, bouncer, connection, addr, debug=False):
         #print "Initializing ListenThread..."
         self.bouncer = bouncer
         self.connection = connection
@@ -232,11 +225,29 @@ class BouncerConnection (Thread):
         self.idnt = None
         self.realname = None
         self.addr = addr
+        self.debug = debug
+        self.lock = Lock()
         self.quitmsg = "Connection Closed"
+        self.quitting = False
 
         Thread.__init__(self)
         self.daemon = True
         self.start()
+
+    def send(self, data, flags=0):
+        try:
+            with self.lock:
+                self.connection.send(data, flags=flags)
+        except socket.error:
+            with self.IRC.loglock:
+                timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(
+                    2, "0") for t in time.localtime()[0:6]])
+                exc, excmsg, tb = sys.exc_info()
+                print >>self.IRC.log, "%(timestamp)s !!! [BouncerConnection.send] Exception in module %(module)s" % vars()
+                for tbline in traceback.format_exc().split("\n"):
+                    print >>self.IRC.log, "%(timestamp)s !!! [BouncerConnection.send] %(tbline)s" % vars()
+                self.IRC.log.flush()
+            self.quit(quitmsg=excmsg.message)
 
     def __repr__(self):
         server = self.IRC.server if self.IRC else "*"
@@ -254,16 +265,19 @@ class BouncerConnection (Thread):
         return "<Bouncer connection from %(addr)s to %(nick)s!%(ident)s@%(host)s on %(protocol)s://%(server)s:%(port)s>" % locals()
 
     def quit(self, quitmsg="Disconnected"):
-        self.quitmsg = quitmsg
-        try:
-            self.connection.send("ERROR :Closing link: (%s@%s) [%s]\n" % (self.IRC.identity.nick if self.IRC else "*", self.host, quitmsg))
-        except:
-            pass
-        try:
-            self.connection.shutdown(1)
-            self.connection.close()
-        except:
-            pass
+        if not self.quitting:
+            self.quitmsg = quitmsg
+            with self.lock:
+                try:
+                    self.connection.send("ERROR :Closing link: (%s@%s) [%s]\n" % (self.IRC.identity.nick if self.IRC else "*", self.host, quitmsg))
+                except:
+                    pass
+                try:
+                    self.connection.shutdown(1)
+                    self.connection.close()
+                except:
+                    pass
+                self.quitting = True
 
     def run(self):
         ### Add connection to connection list.
@@ -329,23 +343,26 @@ class BouncerConnection (Thread):
                                     print >>self.IRC.log, "%s *** [BouncerConnection] Incoming connection from %s to %s." % (timestamp, self.host, self.IRC)
                                     self.IRC.log.flush()
                                 with self.bouncer.lock:
-                                    self.bouncer.connections.append(self)
                                     ### Announce connection to all other bouncer connections.
+                                    if self.debug:
+                                        with self.IRC.loglock:
+                                            timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                                            print >>self.IRC.log, "%(timestamp)s dbg [BouncerConnection] Attempting to broadcast incoming connection %(self)s." % vars()
+                                            self.IRC.log.flush()
                                     for bouncerconnection in self.bouncer.connections:
-                                        try:
-                                            bouncerconnection.connection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s\n" % (bouncerconnection.IRC.identity.nick, self.host, self.IRC))
-                                        except:
+                                        if self.debug:
                                             with self.IRC.loglock:
-                                                exc, excmsg, tb = sys.exc_info()
-                                                print >>self.IRC.log, "%(timestamp)s !!! [BouncerConnection] Exception in module %(self)s" % vars()
-                                                for tbline in traceback.format_exc().split("\n"):
-                                                    print >>self.IRC.log, "%(timestamp)s !!! [BouncerConnection] %(tbline)s" % vars()
+                                                timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                                                print >>self.IRC.log, "%(timestamp)s dbg [BouncerConnection] Broadcasting to %(bouncerconnection)s." % vars()
                                                 self.IRC.log.flush()
-                                            bouncerconnection.quitmsg = excmsg
-                                            try:
-                                                bouncerconnection.connection.shutdown(0)
-                                            except:
-                                                pass
+                                        if not bouncerconnection.quitting:
+                                            bouncerconnection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s\n" % (bouncerconnection.IRC.identity.nick, self.host, self.IRC))
+                                            if self.debug:
+                                                with self.IRC.loglock:
+                                                    timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                                                    print >>self.IRC.log, "%(timestamp)s dbg [BouncerConnection] Success: %(bouncerconnection)s." % vars()
+                                                    self.IRC.log.flush()
+                                    self.bouncer.connections.append(self)
 
                                 if not (self.IRC.connected and self.IRC.registered and type(self.IRC.supports) == dict and "CHANMODES" in self.IRC.supports.keys() and passmatch):
                                     self.quit("Access Denied")
@@ -364,80 +381,81 @@ class BouncerConnection (Thread):
                                 ### Log incoming connection
 
                                 ### Send Greeting.
-                                self.connection.send(":%s 001 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.welcome))
-                                self.connection.send(":%s 002 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.hostinfo))
-                                self.connection.send(":%s 003 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.servinfo))
-                                self.connection.send(":%s 004 %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.serv004))
+                                with self.lock:
+                                    self.connection.send(":%s 001 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.welcome))
+                                    self.connection.send(":%s 002 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.hostinfo))
+                                    self.connection.send(":%s 003 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.servinfo))
+                                    self.connection.send(":%s 004 %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.serv004))
 
-                                ### Send 005 response.
-                                supports = ["CHANMODES=%s"%(",".join(value)) if name == "CHANMODES" else "PREFIX=(%s)%s"%value if name == "PREFIX" else "%s=%s"%(name, value) if value else name for name, value in self.IRC.supports.items()]
-                                supports.sort()
-                                supportsreply = []
-                                supportsstr = " ".join(supports)
-                                index = 0
-                                while True:
-                                    if len(supportsstr)-index > 196:
-                                        nextindex = supportsstr.rfind(" ", index, index+196)
-                                        supportsreply.append(supportsstr[index:nextindex])
-                                        index = nextindex+1
-                                    else:
-                                        supportsreply.append(supportsstr[index:])
-                                        break
-                                for support in supportsreply:
-                                    self.connection.send(":%s 005 %s %s :are supported by this server\n" % (self.IRC.serv, self.IRC.identity.nick, support))
+                                    ### Send 005 response.
+                                    supports = ["CHANMODES=%s"%(",".join(value)) if name == "CHANMODES" else "PREFIX=(%s)%s"%value if name == "PREFIX" else "%s=%s"%(name, value) if value else name for name, value in self.IRC.supports.items()]
+                                    supports.sort()
+                                    supportsreply = []
+                                    supportsstr = " ".join(supports)
+                                    index = 0
+                                    while True:
+                                        if len(supportsstr)-index > 196:
+                                            nextindex = supportsstr.rfind(" ", index, index+196)
+                                            supportsreply.append(supportsstr[index:nextindex])
+                                            index = nextindex+1
+                                        else:
+                                            supportsreply.append(supportsstr[index:])
+                                            break
+                                    for support in supportsreply:
+                                        self.connection.send(":%s 005 %s %s :are supported by this server\n" % (self.IRC.serv, self.IRC.identity.nick, support))
 
-                                ### Send MOTD
-                                self.connection.send(":%s 375 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.motdgreet))
-                                for motdline in self.IRC.motd:
-                                    self.connection.send(":%s 372 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, motdline))
-                                self.connection.send(":%s 376 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.motdend))
+                                    ### Send MOTD
+                                    self.connection.send(":%s 375 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.motdgreet))
+                                    for motdline in self.IRC.motd:
+                                        self.connection.send(":%s 372 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, motdline))
+                                    self.connection.send(":%s 376 %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.motdend))
 
-                                ### Send user modes and snomasks.
-                                self.connection.send(":%s 221 %s +%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.modes))
-                                if "s" in self.IRC.identity.modes and self.IRC.identity.snomask:
-                                    self.connection.send(":%s 008 %s +%s :Server notice mask\n" % (self.IRC.server, self.IRC.identity.nick, self.IRC.identity.snomask))
+                                    ### Send user modes and snomasks.
+                                    self.connection.send(":%s 221 %s +%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.modes))
+                                    if "s" in self.IRC.identity.modes and self.IRC.identity.snomask:
+                                        self.connection.send(":%s 008 %s +%s :Server notice mask\n" % (self.IRC.server, self.IRC.identity.nick, self.IRC.identity.snomask))
 
-    #                                                       ### Join user to internal bouncer channel.
-    #                                                       self.connection.send(":%s!%s@%s JOIN :$bouncer\n" % (self.IRC.identity.nick, self.IRC.identity.idnt, self.IRC.identity.host))
+        #                                                       ### Join user to internal bouncer channel.
+        #                                                       self.connection.send(":%s!%s@%s JOIN :$bouncer\n" % (self.IRC.identity.nick, self.IRC.identity.idnt, self.IRC.identity.host))
 
-    #                                                       ### Set internal bouncer topic.
-    #                                                       self.connection.send(":$bouncer 332 %s $bouncer :Bouncer internal channel. Enter bouncer commands here.\n" % (self.IRC.identity.nick))
-    #                                                       self.connection.send(":$bouncer 333 %s $bouncer $bouncer %s\n" % (self.IRC.identity.nick, self.bouncer.starttime))
+        #                                                       ### Set internal bouncer topic.
+        #                                                       self.connection.send(":$bouncer 332 %s $bouncer :Bouncer internal channel. Enter bouncer commands here.\n" % (self.IRC.identity.nick))
+        #                                                       self.connection.send(":$bouncer 333 %s $bouncer $bouncer %s\n" % (self.IRC.identity.nick, self.bouncer.starttime))
 
-    #                                                       ### Send NAMES for internal bouncer channel.
-    #                                                       self.connection.send(":$bouncer 353 %s @ $bouncer :%s\n" % (
-    #                                                               self.IRC.identity.nick,
-    #                                                               string.join(["@*Bouncer*"]+["@%s"%bouncerconnection.label for bouncerconnection in self.bouncer.connections]))
-    #                                                               )
-    #                                                       self.connection.send(":$bouncer 366 %s $bouncer :End of /NAMES list.\n" % (self.IRC.identity.nick))
+        #                                                       ### Send NAMES for internal bouncer channel.
+        #                                                       self.connection.send(":$bouncer 353 %s @ $bouncer :%s\n" % (
+        #                                                               self.IRC.identity.nick,
+        #                                                               string.join(["@*Bouncer*"]+["@%s"%bouncerconnection.label for bouncerconnection in self.bouncer.connections]))
+        #                                                               )
+        #                                                       self.connection.send(":$bouncer 366 %s $bouncer :End of /NAMES list.\n" % (self.IRC.identity.nick))
 
-    #                                                       ### Give operator mode to user.
-    #                                                       self.connection.send(":*Bouncer* MODE $bouncer +o %s\n" % (self.IRC.identity.nick))
+        #                                                       ### Give operator mode to user.
+        #                                                       self.connection.send(":*Bouncer* MODE $bouncer +o %s\n" % (self.IRC.identity.nick))
 
-                                ### Join user to channels.
-                                for channel in self.IRC.identity.channels:
-                                    ### JOIN command
-                                    self.connection.send(":%s!%s@%s JOIN :%s\n" % (self.IRC.identity.nick, self.IRC.identity.idnt, self.IRC.identity.host, channel.name))
+                                    ### Join user to channels.
+                                    for channel in self.IRC.identity.channels:
+                                        ### JOIN command
+                                        self.connection.send(":%s!%s@%s JOIN :%s\n" % (self.IRC.identity.nick, self.IRC.identity.idnt, self.IRC.identity.host, channel.name))
 
-                                    ### Topic
-                                    self.connection.send(":%s 332 %s %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.topic))
-                                    self.connection.send(":%s 333 %s %s %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.topicsetby, channel.topictime))
+                                        ### Topic
+                                        self.connection.send(":%s 332 %s %s :%s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.topic))
+                                        self.connection.send(":%s 333 %s %s %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.topicsetby, channel.topictime))
 
-                                    ### Determine if +s or +p modes are set in channel
-                                    secret = "s" in channel.modes.keys() and channel.modes["s"]
-                                    private = "p" in channel.modes.keys() and channel.modes["p"]
+                                        ### Determine if +s or +p modes are set in channel
+                                        secret = "s" in channel.modes.keys() and channel.modes["s"]
+                                        private = "p" in channel.modes.keys() and channel.modes["p"]
 
-                                    ### Construct NAMES for channel.
-                                    namesusers = []
-                                    modes, symbols = self.IRC.supports["PREFIX"]
-                                    self.connection.send(":%s 353 %s %s %s :%s\n" % (
-                                                         self.IRC.serv,
-                                                         self.IRC.identity.nick,
-                                                         "@" if secret else ("*" if private else "="),
-                                                         channel.name,
-                                                         string.join([string.join([symbols[k] if modes[k] in channel.modes.keys() and user in channel.modes[modes[k]] else "" for k in xrange(len(modes))], "")+user.nick for user in channel.users]))
-                                                         )
-                                    self.connection.send(":%s 366 %s %s :End of /NAMES list.\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name))
+                                        ### Construct NAMES for channel.
+                                        namesusers = []
+                                        modes, symbols = self.IRC.supports["PREFIX"]
+                                        self.connection.send(":%s 353 %s %s %s :%s\n" % (
+                                                             self.IRC.serv,
+                                                             self.IRC.identity.nick,
+                                                             "@" if secret else ("*" if private else "="),
+                                                             channel.name,
+                                                             string.join([string.join([symbols[k] if modes[k] in channel.modes.keys() and user in channel.modes[modes[k]] else "" for k in xrange(len(modes))], "")+user.nick for user in channel.users]))
+                                                             )
+                                        self.connection.send(":%s 366 %s %s :End of /NAMES list.\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name))
 
                         else:  # User not found
                             self.quit("Access Denied")
@@ -451,12 +469,14 @@ class BouncerConnection (Thread):
                     break
 
                 elif cmd.upper() == "PING":
-                    self.connection.send(":%s PONG %s :%s\n" % (self.IRC.serv, self.IRC.serv, self.IRC.identity.nick))
+                    with self.lock:
+                        self.connection.send(":%s PONG %s :%s\n" % (self.IRC.serv, self.IRC.serv, self.IRC.identity.nick))
 
                 elif cmd.upper() == "WHO" and target.lower() == "$bouncer":
-                    for bouncerconnection in self.bouncer.connections:
-                        self.connection.send(":$bouncer 352 %s $bouncer %s %s $bouncer %s H@ :0 %s\n" % (self.IRC.identity.nick, bouncerconnection.idnt, bouncerconnection.host, bouncerconnection.label, bouncerconnection.IRC))
-                    self.connection.send(":$bouncer 315 %s $bouncer :End if /WHO list.\n" % (self.IRC.identity.nick))
+                    with self.lock:
+                        for bouncerconnection in self.bouncer.connections:
+                            self.connection.send(":$bouncer 352 %s $bouncer %s %s $bouncer %s H@ :0 %s\n" % (self.IRC.identity.nick, bouncerconnection.idnt, bouncerconnection.host, bouncerconnection.label, bouncerconnection.IRC))
+                        self.connection.send(":$bouncer 315 %s $bouncer :End if /WHO list.\n" % (self.IRC.identity.nick))
 
                 elif cmd.upper() in ("PRIVMSG", "NOTICE"):
                     ### Check if CTCP
@@ -467,17 +487,15 @@ class BouncerConnection (Thread):
                         if ctcp and cmd.upper() == "NOTICE":
                             (ctcptype, ext) = ctcp[0]  # Unpack CTCP info
                             if ctcptype == "VERSION":  # Client is sending back version reply
+                                reply = ":%s!%s@%s PRIVMSG $bouncer :Version reply: %s\n" % (self.label, self.idnt, self.addr[0], ext)
                                 for bouncerconnection in self.bouncer.connections:
-                                    reply = ":%s!%s@%s PRIVMSG $bouncer :Version reply: %s\n" % (self.label, self.idnt, self.addr[0], ext)
-                                    try:
-                                        bouncerconnection.connection.send(reply)
-                                    except:
-                                        pass
+                                    bouncerconnection.connection.send(reply)
                     elif ctcp:  # If CTCP, only want to
                         (ctcptype, ext) = ctcp[0]  # Unpack CTCP info
 
                         if ctcptype == "LAGCHECK":  # Client is doing a lag check. No need to send to IRC network, just reply back.
-                            self.connection.send(":%s!%s@%s %s\n" % (self.IRC.identity.nick, self.IRC.identity.idnt, self.IRC.identity.host, line))
+                            with self.lock:
+                                self.connection.send(":%s!%s@%s %s\n" % (self.IRC.identity.nick, self.IRC.identity.idnt, self.IRC.identity.host, line))
                         else:
                             self.IRC.raw(line, origin=self)
                     else:
@@ -490,8 +508,9 @@ class BouncerConnection (Thread):
                             modes = channel.modes.keys()
                             modestr = "".join([mode for mode in modes if mode not in self.IRC.supports["CHANMODES"][0]+self.IRC.supports["PREFIX"][0] and channel.modes[mode]])
                             params = " ".join([channel.modes[mode] for mode in modes if mode in self.IRC.supports["CHANMODES"][1]+self.IRC.supports["CHANMODES"][2] and channel.modes[mode]])
-                            self.connection.send(":%s 324 %s %s +%s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, modestr, params))
-                            self.connection.send(":%s 329 %s %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.created))
+                            with self.lock:
+                                self.connection.send(":%s 324 %s %s +%s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, modestr, params))
+                                self.connection.send(":%s 329 %s %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.created))
                         elif re.match("^\\+?[%s]+$"%self.IRC.supports["CHANMODES"][0], params) and extinfo == "":
                             #print "ddd Mode List Request", params
                             channel = self.IRC.channel(target)
@@ -500,17 +519,19 @@ class BouncerConnection (Thread):
                                 if mode in redundant or mode not in listnumerics.keys():
                                     continue
                                 i, e, l = listnumerics[mode]
-                                if mode in channel.modes.keys():
-                                    for (mask, setby, settime) in channel.modes[mode]:
-                                        self.connection.send(":%s %d %s %s %s %s %s\n" % (self.IRC.serv, i, channel.context.identity.nick, channel.name, mask, setby, settime))
-                                self.connection.send(":%s %d %s %s :End of %s\n" % (self.IRC.serv, e, channel.context.identity.nick, channel.name, l))
+                                with self.lock:
+                                    if mode in channel.modes.keys():
+                                        for (mask, setby, settime) in channel.modes[mode]:
+                                            self.connection.send(":%s %d %s %s %s %s %s\n" % (self.IRC.serv, i, channel.context.identity.nick, channel.name, mask, setby, settime))
+                                    self.connection.send(":%s %d %s %s :End of %s\n" % (self.IRC.serv, e, channel.context.identity.nick, channel.name, l))
                                 redundant.append(mode)
                         else:
                             self.IRC.raw(line, origin=self)
                     elif params == "" and target.lower() == self.IRC.identity.nick.lower():
-                        self.connection.send(":%s 221 %s +%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.modes))
-                        if "s" in self.IRC.identity.modes and self.IRC.identity.snomask:
-                            self.connection.send(":%s 008 %s +%s :Server notice mask\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.snomask))
+                        with self.lock:
+                            self.connection.send(":%s 221 %s +%s\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.modes))
+                            if "s" in self.IRC.identity.modes and self.IRC.identity.snomask:
+                                self.connection.send(":%s 008 %s +%s :Server notice mask\n" % (self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.snomask))
                     else:
                         self.IRC.raw(line, origin=self)
                 else:
@@ -530,11 +551,12 @@ class BouncerConnection (Thread):
                     self.IRC.log.flush()
         finally:
             ### Juuuuuuust in case.
-            try:
-                self.connection.shutdown(1)
-                self.connection.close()
-            except:
-                pass
+            with self.lock:
+                try:
+                    self.connection.shutdown(1)
+                    self.connection.close()
+                except:
+                    pass
 
             if self.IRC:
                 with self.IRC.loglock:
@@ -545,21 +567,24 @@ class BouncerConnection (Thread):
             if self in self.bouncer.connections:
                 with self.bouncer.lock:
                     self.bouncer.connections.remove(self)
+                    if self.debug:
+                        with self.IRC.loglock:
+                            timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                            print >>self.IRC.log, "%(timestamp)s dbg [BouncerConnection] Attempting to broadcast terminated connection %(self)s." % vars()
+                            self.IRC.log.flush()
                     for bouncerconnection in self.bouncer.connections:
-                        try:
-                            bouncerconnection.connection.send(":*Bouncer* NOTICE %s :Connection from %s to %s terminated (%s)\n" % (bouncerconnection.IRC.identity.nick, self.host, self.IRC, self.quitmsg))
-                        except:
+                        if self.debug:
                             with self.IRC.loglock:
-                                exc, excmsg, tb = sys.exc_info()
-                                print >>self.IRC.log, "%(timestamp)s !!! [BouncerConnection] Exception in module %(self)s" % vars()
-                                for tbline in traceback.format_exc().split("\n"):
-                                    print >>self.IRC.log, "%(timestamp)s !!! [BouncerConnection] %(tbline)s" % vars()
+                                timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                                print >>self.IRC.log, "%(timestamp)s dbg [BouncerConnection] Broadcasting to %(bouncerconnection)s." % vars()
                                 self.IRC.log.flush()
-                            bouncerconnection.quitmsg = excmsg
-                            try:
-                                bouncerconnection.connection.shutdown(0)
-                            except:
-                                pass
+                        if not bouncerconnection.quitting:
+                            bouncerconnection.connection.send(":*Bouncer* NOTICE %s :Connection from %s to %s terminated (%s)\n" % (bouncerconnection.IRC.identity.nick, self.host, self.IRC, self.quitmsg))
+                            if self.debug:
+                                with self.IRC.loglock:
+                                    timestamp = reduce(lambda x, y: x+":"+y, [str(t).rjust(2, "0") for t in time.localtime()[0:6]])
+                                    print >>self.IRC.log, "%(timestamp)s dbg [BouncerConnection] Success: %(bouncerconnection)s." % vars()
+                                    self.IRC.log.flush()
 
 #                               ### Announce QUIT to other bouncer connections.
 #                               for bouncerconnection in self.bouncer.connections:
