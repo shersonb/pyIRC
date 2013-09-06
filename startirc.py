@@ -12,7 +12,7 @@ import sys
 import irc
 import bouncer
 import readline
-readline.parse_and_bind("tab: complete")
+#readline.parse_and_bind("tab: complete")
 
 networks = {}
 
@@ -54,7 +54,7 @@ logroot = os.path.join(os.environ["HOME"], "IRC")
 
 insomnialog = open(os.path.join(logroot, "insomnia.log"), "a")
 InsomniaIRC = networks["InsomniaIRC"] = irc.Connection(
-    server="irc.insomniairc.net", ipv6=False, ssl=True, log=insomnialog)
+    server="perseus.insomniairc.net", ipv6=False, ssl=True, log=insomnialog)
 
 ax = autoexec.Autoexec()
 log = logger.Logger(logroot)

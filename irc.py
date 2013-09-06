@@ -386,7 +386,11 @@ class Connection(Thread):
                                         channel.modes["e"] = [(exception, nick, int(exctime))]
                                 elif cmd == 352:  # WHO reply
                                     (channame, ident, host, serv, nick, flags) = params.split()
-                                    (hops, realname) = extinfo.split(" ", 1)
+                                    try:
+                                        (hops, realname) = extinfo.split(" ", 1)
+                                    except ValueError:
+                                        hops = extinfo
+                                        realname = None
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.modules, line=line, data=parsed)
                                     if channel.name != channame:
