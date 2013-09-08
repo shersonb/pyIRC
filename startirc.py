@@ -12,7 +12,8 @@ import sys
 import irc
 import bouncer
 import readline
-#readline.parse_and_bind("tab: complete")
+import rlcompleter
+readline.parse_and_bind("tab: complete")
 
 networks = {}
 
