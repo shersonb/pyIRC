@@ -60,12 +60,6 @@ class Bouncer (Thread):
                 (connection, addr) = self.socket.accept()
                 if self.ssl:
                     connection = ssl.wrap_socket(connection, server_side=True, certfile=self.certfile, keyfile=self.keyfile, ssl_version=ssl.PROTOCOL_SSLv23)
-                try:
-                    hostname, aliaslist, addresslist = socket.gethostbyaddr(
-                        addr[0])
-                    addr = (hostname, addr[1])
-                except:
-                    pass
                 #print ((self,"New client connecting from %s:%s"%addr))
             except socket.error:
                 #print "Shutting down Listener"
@@ -354,12 +348,7 @@ class BouncerConnection (Thread):
         #print "Initializing ListenThread..."
         self.bouncer = bouncer
         self.connection = connection
-        if len(addr) == 4:
-            self.host, self.port = self.addr = addr[:2]
-            self.ipv6 = True
-        else:
-            self.host, self.port = self.addr = addr
-            self.ipv6 = False
+        self.host, self.port = self.addr = addr[:2]
         self.IRC = None
         self.pwd = None
         self.nick = None
@@ -396,7 +385,14 @@ class BouncerConnection (Thread):
             nick = "*"
             ident = "*"
             host = "*"
-        protocol = "ircs" if self.IRC.ssl else "irc"
+        if self.IRC.ssl and self.IRC.ipv6:
+            protocol = "ircs6"
+        elif self.IRC.ssl:
+            protocol = "ircs"
+        elif self.IRC.ipv6:
+            protocol = "irc6"
+        else:
+            protocol = "irc"
         addr = self.host
         return "<Bouncer connection from %(addr)s to %(nick)s!%(ident)s@%(host)s on %(protocol)s://%(server)s:%(port)s>" % locals()
 
@@ -416,6 +412,22 @@ class BouncerConnection (Thread):
                 self.quitting = True
 
     def run(self):
+        ### Name loopup should happen here instead
+        ipv4match = re.findall(
+            r"^::ffff:((\d+)\.(\d+)\.(\d+)\.(\d+))$", self.host)
+        if self.bouncer.ipv6 and ipv4match:
+            addr, a, b, c, d = ipv4match[0]
+            if max(int(a), int(b), int(c), int(d)) < 256:
+                self.host = addr
+                self.ipv6 = False
+        elif self.bouncer.ipv6:
+            self.ipv6 = True
+        try:
+            self.host, aliaslist, addresslist = socket.gethostbyaddr(self.host)
+            self.addr = (self.host, addr[1])
+        except:
+            pass
+
         ### Add connection to connection list.
 
         listnumerics = dict(b=(367, 368, "channel ban list"),
