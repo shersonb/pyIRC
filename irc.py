@@ -1085,6 +1085,18 @@ class Connection(Thread):
         return "<IRC Context: %(nick)s!%(user)s@%(host)s on %(protocol)s://%(server)s:%(port)s>" % locals()
         #else: return "<IRC Context: irc%(ssl)s://%(server)s:%(port)s>" % locals()
 
+    def oper(self, name, passwd, origin=None):
+        self.raw("OPER %s %s" % (re.findall("^([^\r\n\\s]*)", name)[0],
+                                 re.findall("^([^\r\n\\s]*)", passwd)[0]), origin=origin)
+
+    def list(self, params, origin=None):
+        self.raw("LIST %s" % (re.findall("^([^\r\n\\s]*)", params)[
+            0]), origin=origin)
+
+    def getmotd(self, target, origin=None):
+        self.raw("MOTD %s" % (re.findall("^([^\r\n\\s]*)", target)[
+            0]), origin=origin)
+
     def quit(self, msg="", origin=None):
         with self.lock:
             if self.connected:
@@ -1200,6 +1212,13 @@ class Channel(object):
         else:
             self.context.raw("PART %s" % self.name, origin=origin)
 
+    def invite(self, user, origin=None):
+        nickname = user.nick if type(
+            user) == User else re.findall("^([^\r\n\\s]*)", user)[0]
+        if nickname == "":
+            raise InvalidName
+        self.context.raw("INVITE %s %s" % (nickname, self.name), origin=origin)
+
     def join(self, key="", origin=None):
         if len(re.findall("^([^\r\n\\s]*)", key)[0]):
             self.context.raw("JOIN %s %s" % (self.name, re.findall(
@@ -1208,12 +1227,16 @@ class Channel(object):
             self.context.raw("JOIN %s" % self.name, origin=origin)
 
     def kick(self, user, msg="", origin=None):
+        nickname = user.nick if type(
+            user) == User else re.findall("^([^\r\n\\s]*)", user)[0]
+        if nickname == "":
+            raise InvalidName
         if len(re.findall("^([^\r\n]*)", msg)[0]):
-            self.context.raw("KICK %s %s :%s" % (self.name, user.nick,
+            self.context.raw("KICK %s %s :%s" % (self.name, nickname,
                                                  re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
         else:
             self.context.raw("KICK %s %s" % (self.name,
-                                             user.nick), origin=origin)
+                                             nickname), origin=origin)
 
     def __repr__(self):
         return "<Channel: "+self.name+"@"+self.context.server+"/"+str(self.context.port)+">"
