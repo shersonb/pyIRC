@@ -26,6 +26,10 @@ class InvalidName(BaseException):
     pass
 
 
+class InvalidPrefix(BaseException):
+    pass
+
+
 class InvalidCharacter(BaseException):
     pass
 
@@ -1089,13 +1093,33 @@ class Connection(Thread):
         self.raw("OPER %s %s" % (re.findall("^([^\r\n\\s]*)", name)[0],
                                  re.findall("^([^\r\n\\s]*)", passwd)[0]), origin=origin)
 
-    def list(self, params, origin=None):
-        self.raw("LIST %s" % (re.findall("^([^\r\n\\s]*)", params)[
-            0]), origin=origin)
+    def list(self, params="", origin=None):
+        if len(re.findall("^([^\r\n\\s]*)", params)[0]):
+            self.raw("LIST %s" % (re.findall(
+                "^([^\r\n\\s]*)", params)[0]), origin=origin)
+        else:
+            self.raw("LIST", origin=origin)
 
-    def getmotd(self, target, origin=None):
-        self.raw("MOTD %s" % (re.findall("^([^\r\n\\s]*)", target)[
-            0]), origin=origin)
+    def getmotd(self, target="", origin=None):
+        if len(re.findall("^([^\r\n\\s]*)", target)[0]):
+            self.raw("MOTD %s" % (re.findall(
+                "^([^\r\n\\s]*)", target)[0]), origin=origin)
+        else:
+            self.raw("MOTD", origin=origin)
+
+    def version(self, target="", origin=None):
+        if len(re.findall("^([^\r\n\\s]*)", target)[0]):
+            self.raw("VERSION %s" % (re.findall(
+                "^([^\r\n\\s]*)", target)[0]), origin=origin)
+        else:
+            self.raw("VERSION", origin=origin)
+
+    def stats(self, query, target="", origin=None):
+        if len(re.findall("^([^\r\n\\s]*)", target)[0]):
+            self.raw("STATS %s %s" % (query, re.findall(
+                "^([^\r\n\\s]*)", target)[0]), origin=origin)
+        else:
+            self.raw("STATS %s"%query, origin=origin)
 
     def quit(self, msg="", origin=None):
         with self.lock:
@@ -1175,13 +1199,23 @@ class Channel(object):
         self.lock = Lock()
 
     def msg(self, msg, target="", origin=None):
+        if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
+            raise InvalidPrefix
         for line in re.findall("([^\r\n]+)", msg):
-            self.context.raw("PRIVMSG %s%s :%s" % (self.name,
+            self.context.raw("PRIVMSG %s%s :%s" % (target,
                                                    self.name, line), origin=origin)
 
+    def who(self, origin=None):
+        self.context.raw("WHO %s" % (self.name), origin=origin)
+
+    def names(self, origin=None):
+        self.context.raw("NAMES %s" % (self.name), origin=origin)
+
     def notice(self, msg, target="", origin=None):
+        if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
+            raise InvalidPrefix
         for line in re.findall("([^\r\n]+)", msg):
-            self.context.raw("NOTICE %s%s :%s" % (self.name,
+            self.context.raw("NOTICE %s%s :%s" % (target,
                                                   self.name, line), origin=origin)
 
     def settopic(self, msg, origin=None):
