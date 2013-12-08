@@ -22,6 +22,14 @@ def timestamp():
     return "%04d-%02d-%02d %02d:%02d:%02d.%03d%s%02d:%02d"%(ymdhms[:6]+(1000*t%1000, sgn, abs(tz)/3600, abs(tz)/60%60))
 
 
+class InvalidName(BaseException):
+    pass
+
+
+class InvalidCharacter(BaseException):
+    pass
+
+
 class Connection(Thread):
     def __init__(self, server, nick="ircbot", username="python", realname="Python IRC Library", passwd=None, port=None, ipv6=False, ssl=False, autoreconnect=True, log=sys.stderr, timeout=300, retrysleep=5, maxretries=15, onlogin=None):
         self.__name__ = "pyIRC"
@@ -74,6 +82,7 @@ class Connection(Thread):
         self.loglock = Lock()
         self.sendlock = Lock()
         self.outgoing = Queue.Queue()
+        self.outgoingthread = None
 
         Thread.__init__(self)
 
@@ -152,7 +161,6 @@ class Connection(Thread):
         maskmodeeventnames = dict(b=("Ban", "Unban"), e=(
             "BanExcept", "UnbanExcept"), I=("Invite", "Uninvite"))
         self.quitexpected = False
-        outgoingthread = None
         whoisstarted = False
         nameslist = []
         wholist = []
@@ -194,9 +202,9 @@ class Connection(Thread):
 
                             ### Setting up thread responsible for sending data back to IRC server.
                             self.outgoing._interrupted = False
-                            outgoingthread = Outgoing(self)
-                            outgoingthread.daemon = True
-                            outgoingthread.start()
+                            self.outgoingthread = Outgoing(self)
+                            self.outgoingthread.daemon = True
+                            self.outgoingthread.start()
 
                             ### Run onConnect on all addons to signal connection was established.
                             self.event("onConnect", self.addons+reduce(lambda x, y: x+y, [chan.addons for chan in self.channels], []))
@@ -220,10 +228,10 @@ class Connection(Thread):
                     nick = self.nick[0]
                     trynick = 0
                     if self.passwd:
-                        self.raw("PASS :%(passwd)s" % vars(self))
-                    self.raw("NICK :%(nick)s" % vars())
-                    self.raw("USER %(username)s * * :%(realname)s" %
-                             vars(self))
+                        self.raw("PASS :%s" % self.passwd.split(
+                            "\n")[0].rstrip())
+                    self.raw("NICK :%s" % nick.split("\n")[0].rstrip())
+                    self.raw("USER %s * * :%s" % (self.username.split("\n")[0].rstrip(), self.realname.split("\n")[0].rstrip()))
 
                     ### Initialize buffers
                     linebuf = []
@@ -283,7 +291,7 @@ class Connection(Thread):
                                     nick = self.nick[s]
                                     if q > 0:
                                         nick += str(q)
-                                    self.raw("NICK :%(nick)s" % vars())
+                                    self.raw("NICK :%s" % nick.split("\n")[0].rstrip())
                                 if not self.registered:  # Registration is not yet complete
                                     continue
 
@@ -300,7 +308,7 @@ class Connection(Thread):
                                     ### Origin host has changed
                                     origin.host = host
 
-                            chanmatch = re.findall("([%s]?)([%s].+)"%(re.escape(self.supports.get("PREFIX", ("ohv", "@%+"))[1]), re.escape(self.supports.get("CHANTYPES", "#"))), target)
+                            chanmatch = re.findall(r"([%s]?)([%s]\S*)"%(re.escape(self.supports.get("PREFIX", ("ohv", "@%+"))[1]), re.escape(self.supports.get("CHANTYPES", "#"))), target)
                             if chanmatch:
                                 targetprefix, channame = chanmatch[0]
                                 target = self.channel(channame)
@@ -385,11 +393,17 @@ class Connection(Thread):
                                     user.nick = nickname
                                     user.username = username
                                     user.host = host
+
                                 elif cmd == 301:  # Away Message
                                     user = self.user(params)
                                     (handled, unhandled, exceptions) = self.event("onWhoisAway", self.addons, origin=origin, user=user, nickname=params, awaymsg=extinfo)
                                     user.away = True
                                     user.awaymsg = extinfo
+
+                                elif cmd == 303:  # ISON Reply
+                                    users = [self.user(user) for user in extinfo.split(" ")]
+                                    (handled, unhandled, exceptions) = self.event("onIsonReply", self.addons, origin=origin, isonusers=users)
+
                                 elif cmd == 307:  # Is a registered nick
                                     (handled, unhandled, exceptions) = self.event("onWhoisRegisteredNick", self.addons, origin=origin, user=self.user(params), nickname=params, msg=extinfo)
                                 elif cmd == 378:  # Connecting From
@@ -816,6 +830,11 @@ class Connection(Thread):
                                         target.topicsetby = origin
                                         target.topictime = int(time.time())
 
+                                elif cmd == "INVITE":
+                                    channel = self.channel(extinfo if extinfo else params)
+                                    self.event("onRecv", channel.addons, line=line, **data)
+                                    (handled, unhandled, exceptions) = self.event("onInvite", self.addons+channel.addons, user=origin, channel=channel)
+
                                 elif cmd == "PRIVMSG":
                                     if type(target) == Channel:
                                         self.event("onRecv", target.addons, line=line, **data)
@@ -866,186 +885,110 @@ class Connection(Thread):
                                             (handled, unhandled, exceptions) = self.event("onPrivNotice", self.addons, origin=origin, msg=extinfo)
 
                                 elif cmd == 367:  # Channel Ban list
-                                    if 367 in lists.items():
-                                        banlist = lists[367]
-                                    else:
-                                        banlist = lists[367] = []
                                     (channame, mask, setby, settime) = params.split()
                                     channel = self.channel(channame)
-                                    banlist.append((self.channel(channame), mask, setby, int(settime)))
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onBanListEntry", self.addons+channel.addons, origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 368:
-                                    if 367 in lists.items():
-                                        banlist = lists[367]
+                                    if "b" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
+                                            channel.modes["b"].append((mask, setby, int(settime)))
                                     else:
-                                        banlist = lists[367] = []
+                                        channel.modes["b"] = [(mask, setby, int(settime))]
+                                elif cmd == 368:
                                     channel = self.channel(params)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onBanListEnd", self.addons+channel.addons, origin=origin, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in banlist:
-                                        if "b" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
-                                                channel.modes["b"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["b"] = [(mask, setby, int(settime))]
-                                    lists[367] = []
 
                                 elif cmd == 346:  # Channel Invite list
-                                    if 346 in lists.items():
-                                        invitelist = lists[346]
-                                    else:
-                                        invitelist = lists[346] = []
                                     (channame, mask, setby, settime) = params.split()
-                                    invitelist.append((self.channel(channame), mask, setby, int(settime)))
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onInviteListEntry", self.addons+channel.addons, origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 347:
-                                    if 346 in lists.items():
-                                        invitelist = lists[346]
+                                    if "I" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["I"]]:
+                                            channel.modes["I"].append((mask, setby, int(settime)))
                                     else:
-                                        invitelist = lists[346] = []
+                                        channel.modes["I"] = [(mask, setby, int(settime))]
+                                elif cmd == 347:
                                     channel = self.channel(params)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onInviteListEnd", self.addons+channel.addons, origin=origin, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in invitelist:
-                                        if "I" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["I"]]:
-                                                channel.modes["I"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["I"] = [(mask, setby, int(settime))]
-                                    lists[346] = []
 
                                 elif cmd == 348:  # Channel Ban Exception list
-                                    if 348 in lists.items():
-                                        banexceptlist = lists[348]
-                                    else:
-                                        banexceptlist = lists[348] = []
                                     (channame, mask, setby, settime) = params.split()
-                                    banexceptlist.append((self.channel(channame), mask, setby, int(settime)))
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onBanExceptListEntry", self.addons+channel.addons, origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 349:
-                                    if 348 in lists.items():
-                                        banexceptlist = lists[348]
+                                    if "e" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["e"]]:
+                                            channel.modes["e"].append((mask, setby, int(settime)))
                                     else:
-                                        banexceptlist = lists[348] = []
+                                        channel.modes["e"] = [(mask, setby, int(settime))]
+                                elif cmd == 349:
                                     channel = self.channel(params)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onBanExceptListEnd", self.addons+channel.addons, origin=origin, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in banexceptlist:
-                                        if "e" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["e"]]:
-                                                channel.modes["e"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["e"] = [(mask, setby, int(settime))]
-                                    lists[348] = []
 
                                 elif cmd == 910:  # Channel Access List
-                                    if 910 in lists.items():
-                                        accesslist = lists[910]
-                                    else:
-                                        accesslist = lists[910] = []
                                     (channame, mask, setby, settime) = params.split()
-                                    accesslist.append((self.channel(channame), mask, setby, int(settime)))
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onAccessListEntry", self.addons+channel.addons, origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 911:
-                                    if 911 in lists.items():
-                                        accesslist = lists[910]
+                                    if "w" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
+                                            channel.modes["w"].append((mask, setby, int(settime)))
                                     else:
-                                        accesslist = lists[910] = []
+                                        channel.modes["w"] = [(mask, setby, int(settime))]
+                                elif cmd == 911:
                                     channel = self.channel(params)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onAccessListEnd", self.addons+channel.addons, origin=origin, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in accesslist:
-                                        if "w" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
-                                                channel.modes["w"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["w"] = [(mask, setby, int(settime))]
-                                    lists[910] = []
 
                                 elif cmd == 941:  # Spam Filter list
-                                    if 941 in lists.items():
-                                        spamfilterlist = lists[941]
-                                    else:
-                                        spamfilterlist = lists[941] = []
                                     (channame, mask, setby, settime) = params.split()
-                                    spamfilterlist.append((self.channel(channame), mask, setby, int(settime)))
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onSpamfilterListEntry", self.addons+channel.addons, origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 940:
-                                    if 941 in lists.items():
-                                        spamfilterlist = lists[941]
+                                    if "g" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["g"]]:
+                                            channel.modes["g"].append((mask, setby, int(settime)))
                                     else:
-                                        spamfilterlist = lists[941] = []
+                                        channel.modes["g"] = [(mask, setby, int(settime))]
+                                elif cmd == 940:
                                     channel = self.channel(params)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onSpamfilterListEnd", self.addons+channel.addons, origin=origin, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in spamfilterlist:
-                                        if "g" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["g"]]:
-                                                channel.modes["g"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["g"] = [(mask, setby, int(settime))]
-                                    lists[941] = []
 
                                 elif cmd == 954:  # Channel exemptchanops list
-                                    if 954 in lists.items():
-                                        exemptchanopslist = lists[954]
-                                    else:
-                                        exemptchanopslist = lists[954] = []
                                     (channame, mask, setby, settime) = params.split()
-                                    exemptchanopslist.append((self.channel(channame), mask, setby, int(settime)))
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onExemptChanOpsListEntry", self.addons+channel.addons, origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 953:
-                                    if 954 in lists.items():
-                                        exemptchanopslist = lists[954]
+                                    if "X" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["X"]]:
+                                            channel.modes["X"].append((mask, setby, int(settime)))
                                     else:
-                                        exemptchanopslist = lists[954] = []
+                                        channel.modes["X"] = [(mask, setby, int(settime))]
+                                elif cmd == 953:
                                     channel = self.channel(params)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onExemptChanOpsListEnd", self.addons+channel.addons, origin=origin, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in exemptchanopslist:
-                                        if "X" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["X"]]:
-                                                channel.modes["X"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["X"] = [(mask, setby, int(settime))]
-                                    lists[954] = []
 
                                 elif cmd == 728:  # Channel quiet list
-                                    if 728 in lists.items():
-                                        quietlist = lists[728]
-                                    else:
-                                        quietlist = lists[728] = []
                                     (channame, modechar, mask, setby, settime) = params.split()
-                                    quietlist.append((self.channel(channame), mask, setby, int(settime)))
                                     channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onQuietListEntry", self.addons+channel.addons, origin=origin, channel=channel, modechar=modechar, mask=mask, setby=setby, settime=int(settime))
-                                elif cmd == 729:
-                                    if 728 in lists.items():
-                                        quietlist = lists[728]
+                                    if "q" in channel.modes.keys():
+                                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["q"]]:
+                                            channel.modes["q"].append((mask, setby, int(settime)))
                                     else:
-                                        quietlist = lists[728] = []
-                                    channel = self.channel(params)
+                                        channel.modes["q"] = [(mask, setby, int(settime))]
+                                elif cmd == 729:
+                                    channame, modechar = params.split()
+                                    channel = self.channel(channame)
                                     self.event("onRecv", channel.addons, line=line, **data)
                                     (handled, unhandled, exceptions) = self.event("onQuietListEnd", self.addons+channel.addons, channel=channel, endmsg=extinfo)
-                                    for (channame, mask, setby, settime) in quietlist:
-                                        if "q" in channel.modes.keys():
-                                            if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["q"]]:
-                                                channel.modes["q"].append((mask, setby, int(settime)))
-                                        else:
-                                            channel.modes["q"] = [(mask, setby, int(settime))]
-                                    lists[728] = []
 
                                 elif cmd in (495, 384, 385, 386, 468, 470, 366, 315, 482, 484, 953, 368, 482, 349, 940, 911, 489, 490, 492, 520, 530):  # Channels which appear in params
                                     for param in params.split():
@@ -1087,9 +1030,9 @@ class Connection(Thread):
                     self.outgoing.interrupt()
 
                     ### Wait until the outgoing thread dies.
-                    if outgoingthread and outgoingthread.isAlive():
-                        outgoingthread.join()
-                        outgoingthread = None
+                    if self.outgoingthread and self.outgoingthread.isAlive():
+                        self.outgoingthread.join()
+                        self.outgoingthread = None
 
                     try:
                         self.connection.close()
@@ -1145,8 +1088,9 @@ class Connection(Thread):
     def quit(self, msg="", origin=None):
         with self.lock:
             if self.connected:
-                if len(msg):
-                    self.raw("QUIT :%(msg)s" % vars(), origin=origin)
+                if len(re.findall("^([^\r\n]*)", msg)[0]):
+                    self.raw("QUIT :%s" % re.findall("^([^\r\n]*)",
+                                                     msg)[0], origin=origin)
                 else:
                     self.raw("QUIT", origin=origin)
 
@@ -1173,11 +1117,9 @@ class Connection(Thread):
         return reduce(lambda x, y: "%s; %s" % (x, y), reply)
 
     def raw(self, line, origin=None):
-        try:
-            self.outgoing.put((line, origin))
-        except:
-            print (line, origin)
-            raise
+        if "\r" in line or "\n" in line:
+            raise InvalidCharacter
+        self.outgoing.put((line, origin))
 
     def user(self, nick):
         users = [user for user in self.users if user.nick.lower(
@@ -1189,9 +1131,6 @@ class Connection(Thread):
             self.users.append(user)
             timestamp = reduce(lambda x, y: x+":"+y, [str(
                 t).rjust(2, "0") for t in time.localtime()[0:6]])
-            #with self.loglock:
-            #       print >>self.log, "%s *** User %s created."%(timestamp, nick)
-            #       self.log.flush()
             return user
 
     def channel(self, name):
@@ -1204,14 +1143,13 @@ class Connection(Thread):
                 t).rjust(2, "0") for t in time.localtime()[0:6]])
             chan = Channel(name, self)
             self.channels.append(chan)
-            #with self.loglock:
-            #       print >>self.log, "%s *** Channel %s created."%(timestamp, name)
-            #       self.log.flush()
             return chan
 
 
 class Channel(object):
     def __init__(self, name, context):
+        if not re.match(r"^[%s]\S*$" % context.supports.get("CHANTYPES", "#"), name):
+            raise InvalidName(repr(name))
         self.name = name
         self.context = context
         self.addons = []
@@ -1224,55 +1162,58 @@ class Channel(object):
         self.created = None
         self.lock = Lock()
 
-    def msg(self, msg, origin=None):
-        chan = self.name
-        self.context.raw("PRIVMSG %(chan)s :%(msg)s" % vars(), origin=origin)
-
-    def settopic(self, msg, origin=None):
-        chan = self.name
-        self.context.raw("TOPIC %(chan)s :%(msg)s" % vars(), origin=origin)
+    def msg(self, msg, target="", origin=None):
+        for line in re.findall("([^\r\n]+)", msg):
+            self.context.raw("PRIVMSG %s%s :%s" % (self.name,
+                                                   self.name, line), origin=origin)
 
     def notice(self, msg, target="", origin=None):
-        chan = self.name
-        self.context.raw("NOTICE %(target)s%(chan)s :%(msg)s" %
-                         vars(), origin=origin)
+        for line in re.findall("([^\r\n]+)", msg):
+            self.context.raw("NOTICE %s%s :%s" % (self.name,
+                                                  self.name, line), origin=origin)
+
+    def settopic(self, msg, origin=None):
+        self.context.raw("TOPIC %s :%s" % (self.name, re.findall(
+            "^([^\r\n]*)", msg)[0]), origin=origin)
 
     def ctcp(self, act, msg="", origin=None):
-        if len(msg):
-            self.msg("\01%(act)s %(msg)s\01" % vars(), origin=origin)
+        if len(re.findall("^([^\r\n]*)", msg)[0]):
+            self.msg("\01%s %s\01" % (act.upper(), re.findall(
+                "^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.msg("\01%(act)s\01" % vars())
+            self.msg("\01%s\01" % act.upper())
 
     def ctcpreply(self, act, msg="", origin=None):
-        if len(msg):
-            self.notice("\01%(act)s %(msg)s\01" % vars(), origin=origin)
+        if len(re.findall("^([^\r\n]*)", msg)[0]):
+            self.notice("\01%s %(msg)s\01" % (act.upper(),
+                                              re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.notice("\01%(act)s\01" % vars(), origin=origin)
+            self.notice("\01%s\01" % act.upper(), origin=origin)
 
     def me(self, msg="", origin=None):
         self.ctcp("ACTION", msg, origin=origin)
 
     def part(self, msg="", origin=None):
-        chan = self.name
-        if msg:
-            self.context.raw("PART %(chan)s :%(msg)s" % vars(), origin=origin)
+        if len(re.findall("^([^\r\n]*)", msg)[0]):
+            self.context.raw("PART %s :%s" % (self.name,
+                                              re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.context.raw("PART %(chan)s" % vars(), origin)
+            self.context.raw("PART %s" % self.name, origin=origin)
 
     def join(self, key="", origin=None):
-        chan = self.name
-        if key:
-            self.context.raw("JOIN :%(chan)s %(key)s" % vars(), origin=origin)
+        if len(re.findall("^([^\r\n\\s]*)", key)[0]):
+            self.context.raw("JOIN %s %s" % (self.name, re.findall(
+                "^([^\r\n\\s]*)", key)[0]), origin=origin)
         else:
-            self.context.raw("JOIN :%(chan)s" % vars(), origin=origin)
+            self.context.raw("JOIN %s" % self.name, origin=origin)
 
-    def kick(self, nick, msg="", origin=None):
-        chan = self.name
-        if len(msg):
-            self.context.raw("KICK %(chan)s %(nick)s :%(msg)s" %
-                             vars(), origin=origin)
+    def kick(self, user, msg="", origin=None):
+        if len(re.findall("^([^\r\n]*)", msg)[0]):
+            self.context.raw("KICK %s %s :%s" % (self.name, user.nick,
+                                                 re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.context.raw("KICK %(chan)s %(nick)s" % vars(), origin=origin)
+            self.context.raw("KICK %s %s" % (self.name,
+                                             user.nick), origin=origin)
 
     def __repr__(self):
         return "<Channel: "+self.name+"@"+self.context.server+"/"+str(self.context.port)+">"
@@ -1280,6 +1221,8 @@ class Channel(object):
 
 class User(object):
     def __init__(self, nick, context):
+        if not re.match(r"^\S+$", nick):
+            raise InvalidName
         self.nick = nick
         self.username = ""
         self.host = ""
@@ -1300,31 +1243,35 @@ class User(object):
         return "<User: %(nick)s!%(username)s@%(host)s>" % vars(self)
 
     def msg(self, msg, origin=None):
-        nick = self.nick
-        self.context.raw("PRIVMSG %(nick)s :%(msg)s" % vars(), origin=origin)
+        for line in re.findall("([^\r\n]+)", msg):
+            self.context.raw("PRIVMSG %s :%s" % (self.nick,
+                                                 line), origin=origin)
 
     def notice(self, msg, origin=None):
-        nick = self.nick
-        self.context.raw("NOTICE %(nick)s :%(msg)s" % vars(), origin=origin)
+        for line in re.findall("([^\r\n]+)", msg):
+            self.context.raw("NOTICE %s :%s" % (self.nick,
+                                                line), origin=origin)
 
     def ctcp(self, act, msg="", origin=None):
-        if len(msg):
-            self.msg("\01%(act)s %(msg)s\01" % vars(), origin=origin)
+        if len(re.findall("^([^\r\n]*)", msg)[0]):
+            self.msg("\01%s %s\01" % (act.upper(), re.findall(
+                "^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.msg("\01%(act)s\01" % vars(), origin=origin)
+            self.msg("\01%s\01" % act.upper())
 
     def ctcpreply(self, act, msg="", origin=None):
-        if len(msg):
-            self.notice("\01%(act)s %(msg)s\01" % vars(), origin=origin)
+        if len(re.findall("^([^\r\n]*)", msg)[0]):
+            self.notice("\01%s %s\01" % (act.upper(),
+                                         re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.notice("\01%(act)s\01" % vars(), origin=origin)
+            self.notice("\01%s\01" % act.upper(), origin=origin)
 
-    def me(self, msg, origin=None):
+    def me(self, msg="", origin=None):
         self.ctcp("ACTION", msg, origin=origin)
 
 
 class Outgoing(Thread):
-    def __init__(self, IRC, throttle=0.25, lines=40, t=5):
+    def __init__(self, IRC, throttle=0.25, lines=10, t=5):
         self.IRC = IRC
         self.throttle = throttle
         self.lines = lines
