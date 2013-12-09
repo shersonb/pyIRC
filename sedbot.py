@@ -29,7 +29,7 @@ class SED(object):
                     if channel != channel2:
                         continue
                     try:
-                        if re.findall(find, msg2):
+                        if re.findall(find, msg2, flags=re.I if "i" in flags else 0):
                             sub = re.sub(find, replace, msg2, flags=re.I if "i" in flags else 0)
                             match = True
                         else:
