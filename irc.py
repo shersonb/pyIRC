@@ -1,5 +1,5 @@
 #!/usr/bin/python
-from threading import Thread, Event, Lock
+from threading import Thread, Condition, Lock
 import re
 import time
 import sys
@@ -13,15 +13,6 @@ import glob
 import iqueue as Queue
 
 
-def timestamp():
-    t = time.time()
-    ms = 1000*t%1000
-    ymdhms = time.localtime(t)
-    tz = time.altzone if ymdhms.tm_isdst else time.timezone
-    sgn = "-" if tz >= 0 else "+"
-    return "%04d-%02d-%02d %02d:%02d:%02d.%03d%s%02d:%02d"%(ymdhms[:6]+(1000*t%1000, sgn, abs(tz)/3600, abs(tz)/60%60))
-
-
 class InvalidName(BaseException):
     pass
 
@@ -32,6 +23,108 @@ class InvalidPrefix(BaseException):
 
 class InvalidCharacter(BaseException):
     pass
+
+
+class ConnectionTimedOut(BaseException):
+    pass
+
+
+class ConnectionClosed(BaseException):
+    pass
+
+
+class RequestTimedOut(BaseException):
+    pass
+
+
+class NotConnected(BaseException):
+    pass
+
+
+class BannedFromChannel(BaseException):
+    pass
+
+
+class RedirectedJoin(BaseException):
+    pass
+
+
+class ChannelFull(BaseException):
+    pass
+
+
+class InviteOnly(BaseException):
+    pass
+
+
+class NotOnChannel(BaseException):
+    pass
+
+
+class NoSuchChannel(BaseException):
+    pass
+
+
+class BadChannelKey(BaseException):
+    pass
+
+
+class BadChannelMask(BaseException):
+    pass
+
+
+class TooManyChannels(BaseException):
+    pass
+
+
+class Unavailable(BaseException):
+    pass
+
+
+class Cbaned(BaseException):
+    pass
+
+
+class ActionAlreadyRequested(BaseException):
+    pass
+
+
+class OpersOnly(BaseException):
+    pass
+
+
+class OperCreateOnly(BaseException):
+    pass
+
+
+class SSLOnly(BaseException):
+    pass
+
+
+class AlreadyJoined(BaseException):
+    pass
+
+
+class RegistrationRequired(BaseException):
+    pass
+
+
+class RejoinDelay(BaseException):
+    pass
+
+_rfc1459casemapping = string.maketrans(string.ascii_uppercase + r'\[]~',
+                                       string.ascii_lowercase + r'|{}^')
+
+exceptcodes = {489: SSLOnly, 384: Cbaned, 403: NoSuchChannel, 405: TooManyChannels, 442: NotOnChannel, 470: RedirectedJoin, 471: ChannelFull, 473: InviteOnly, 474: BannedFromChannel, 475: BadChannelKey, 476: BadChannelMask, 520: OpersOnly, 437: Unavailable, 477: RegistrationRequired, 495: RejoinDelay, 530: OperCreateOnly}
+
+
+def timestamp():
+    t = time.time()
+    ms = 1000*t%1000
+    ymdhms = time.localtime(t)
+    tz = time.altzone if ymdhms.tm_isdst else time.timezone
+    sgn = "-" if tz >= 0 else "+"
+    return "%04d-%02d-%02d %02d:%02d:%02d.%03d%s%02d:%02d"%(ymdhms[:6]+(1000*t%1000, sgn, abs(tz)/3600, abs(tz)/60%60))
 
 
 class Connection(Thread):
@@ -83,6 +176,7 @@ class Connection(Thread):
         self.supports = {}
 
         self.lock = Lock()
+        self._linereceived = Condition(self.lock)
         self.loglock = Lock()
         self.sendlock = Lock()
         self.outgoing = Queue.Queue()
@@ -281,53 +375,53 @@ class Connection(Thread):
                             else:
                                 cmd = cmd.upper()
 
-                            if not self.registered:
-                                if type(cmd) == int and target != "*":  # Registration complete!
-                                    with self.lock:
+                            with self._linereceived:
+                                if not self.registered:
+                                    if type(cmd) == int and cmd != 451 and target != "*":  # Registration complete!
                                         self.registered = True
                                         self.identity = self.user(target)
                                         self.serv = origin
                                         self.event("onRegistered", self.addons+reduce(lambda x, y: x+y, [chan.addons for chan in self.channels], []))
 
-                                elif cmd == 433 and target == "*":  # Server reports nick taken, so we need to try another.
-                                    trynick += 1
-                                    (q, s) = divmod(trynick, len(self.nick))
-                                    nick = self.nick[s]
-                                    if q > 0:
-                                        nick += str(q)
-                                    self.raw("NICK :%s" % nick.split("\n")[0].rstrip())
-                                if not self.registered:  # Registration is not yet complete
-                                    continue
+                                    elif cmd == 433 and target == "*":  # Server reports nick taken, so we need to try another.
+                                        trynick += 1
+                                        (q, s) = divmod(trynick, len(self.nick))
+                                        nick = self.nick[s]
+                                        if q > 0:
+                                            nick += str(q)
+                                        self.raw("NICK :%s" % nick.split("\n")[0].rstrip())
+                                    if not self.registered:  # Registration is not yet complete
+                                        continue
 
-                            if username and host:
-                                nickname = origin
-                                origin = self.user(origin)
-                                if origin.nick != nickname:
-                                    ### Origin nickname has changed
-                                    origin.user = nickname
-                                if origin.username != username:
-                                    ### Origin username has changed
-                                    origin.username = username
-                                if origin.host != host:
-                                    ### Origin host has changed
-                                    origin.host = host
+                                if username and host:
+                                    nickname = origin
+                                    origin = self.user(origin)
+                                    if origin.nick != nickname:
+                                        ### Origin nickname has changed
+                                        origin.user = nickname
+                                    if origin.username != username:
+                                        ### Origin username has changed
+                                        origin.username = username
+                                    if origin.host != host:
+                                        ### Origin host has changed
+                                        origin.host = host
 
-                            chanmatch = re.findall(r"([%s]?)([%s]\S*)"%(re.escape(self.supports.get("PREFIX", ("ohv", "@%+"))[1]), re.escape(self.supports.get("CHANTYPES", "#"))), target)
-                            if chanmatch:
-                                targetprefix, channame = chanmatch[0]
-                                target = self.channel(channame)
-                                if target.name != channame:
-                                    ### Target channel name has changed
-                                    target.name = channame
-                            elif len(target) and target[0] != "$" and cmd != "NICK":
-                                targetprefix = ""
-                                target = self.user(target)
+                                chanmatch = re.findall(r"([%s]?)([%s]\S*)"%(re.escape(self.supports.get("PREFIX", ("ohv", "@%+"))[1]), re.escape(self.supports.get("CHANTYPES", "#"))), target)
+                                if chanmatch:
+                                    targetprefix, channame = chanmatch[0]
+                                    target = self.channel(channame)
+                                    if target.name != channame:
+                                        ### Target channel name has changed
+                                        target.name = channame
+                                elif len(target) and target[0] != "$" and cmd != "NICK":
+                                    targetprefix = ""
+                                    target = self.user(target)
 
-                            data = dict(origin=origin, cmd=cmd, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo)
+                                self.data = data = dict(origin=origin, cmd=cmd, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo)
+                                self._linereceived.notifyAll()
 
-                            ### Major codeblock here! Track IRC state.
-                            ### Send line to addons first
-                            with self.lock:
+                                ### Major codeblock here! Track IRC state.
+                                ### Send line to addons first
                                 self.event("onRecv", self.addons, line=line,
                                            **data)
                                 if cmd == 1:
@@ -643,6 +737,10 @@ class Connection(Thread):
                                     if origin == self.identity:  # This means the bot is entering the room,
                                         # and will reset all the channel data, on the assumption that such data may have changed.
                                         # Also, the bot must request modes
+                                        with channel._joining:
+                                            if channel._joinrequested:
+                                                channel._joinreply = cmd
+                                                channel._joining.notify()
                                         channel.topic = ""
                                         channel.topicmod = ""
                                         channel.modes = {}
@@ -682,6 +780,10 @@ class Connection(Thread):
                                 elif cmd == "PART":
                                     self.event("onRecv", target.addons, line=line, **data)
                                     if origin == self.identity:
+                                        with target     ._parting:
+                                            if target._partrequested:
+                                                target._partreply = cmd
+                                                target._parting.notify()
                                         self.event("onMePart", self.addons+target.addons, channel=target, partmsg=extinfo)
                                     (handled, unhandled, exceptions) = self.event("onPart", self.addons+target.addons, user=origin, channel=target, partmsg=extinfo)
 
@@ -1005,6 +1107,29 @@ class Connection(Thread):
                                 else:
                                     (handled, unhandled, exceptions) = self.event("on%s"%cmd, self.addons, line=line, origin=origin, cmd=cmd, target=target, params=params, extinfo=extinfo)
 
+                                if cmd in (384, 403, 405, 471, 473, 474, 475, 476, 520, 477, 489, 495):  # Channel Join denied
+                                    try:
+                                        channel = self.channel(params)
+                                    except InvalidName:
+                                        pass
+                                    else:
+                                        with channel._joining:
+                                            if channel._joinrequested:
+                                                channel._joinreply = (cmd, extinfo)
+                                                channel._joining.notify()
+
+                                elif cmd == 470:  # Channel Join denied due to redirect
+                                    channelname, redirect = params.split()
+                                    try:
+                                        channel = self.channel(channelname)
+                                    except InvalidName:
+                                        pass
+                                    else:
+                                        with channel._joining:
+                                            if channel._joinrequested:
+                                                channel._joinreply = (cmd, "%s (%s)"%(extinfo, redirect))
+                                                channel._joining.notify()
+
                                 self.event("onUnhandled", unhandled, line=line, origin=origin, cmd=cmd, target=target, params=params, extinfo=extinfo)
 
                         else:  # Line does NOT match ":origin cmd target params :extinfo"
@@ -1158,8 +1283,11 @@ class Connection(Thread):
         self.outgoing.put((line, origin))
 
     def user(self, nick):
-        users = [user for user in self.users if user.nick.lower(
-        ) == nick.lower()]
+        if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
+            users = [user for user in self.users if user.nick.lower(
+            ) == nick.lower()]
+        else:
+            users = [user for user in self.users if user.nick.translate(_rfc1459casemapping) == nick.translate(_rfc1459casemapping)]
         if len(users):
             return users[0]
         else:
@@ -1170,8 +1298,11 @@ class Connection(Thread):
             return user
 
     def channel(self, name):
-        channels = [chan for chan in self.channels if name.lower(
-        ) == chan.name.lower()]
+        if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
+            channels = [chan for chan in self.channels if chan.name.lower(
+            ) == name.lower()]
+        else:
+            channels = [chan for chan in self.channels if chan.name.translate(_rfc1459casemapping) == name.translate(_rfc1459casemapping)]
         if len(channels):
             return channels[0]
         else:
@@ -1184,7 +1315,8 @@ class Connection(Thread):
 
 class Channel(object):
     def __init__(self, name, context):
-        if not re.match(r"^[%s]\S*$" % context.supports.get("CHANTYPES", "#"), name):
+        chantypes = context.supports.get("CHANTYPES", "&#+!")
+        if not re.match(r"^[%s][^%s\s]*$" % (re.escape(chantypes), re.escape("\x07,")), name):
             raise InvalidName(repr(name))
         self.name = name
         self.context = context
@@ -1197,6 +1329,12 @@ class Channel(object):
         self.users = []
         self.created = None
         self.lock = Lock()
+        self._joinrequested = False
+        self._joinreply = None
+        self._joining = Condition(self.lock)
+        self._partrequested = False
+        self._partreply = None
+        self._parting = Condition(self.lock)
 
     def msg(self, msg, target="", origin=None):
         if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
@@ -1239,12 +1377,43 @@ class Channel(object):
     def me(self, msg="", origin=None):
         self.ctcp("ACTION", msg, origin=origin)
 
-    def part(self, msg="", origin=None):
-        if len(re.findall("^([^\r\n]*)", msg)[0]):
-            self.context.raw("PART %s :%s" % (self.name,
-                                              re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
-        else:
-            self.context.raw("PART %s" % self.name, origin=origin)
+    def part(self, msg="", blocking=False, timeout=30, origin=None):
+        with self.context.lock:
+            if self.context.identity not in self.users:
+                ### Bot is not on the channel
+                raise NotOnChannel
+        with self._parting:
+            try:
+                if self._partrequested:
+                    raise ActionAlreadyRequested
+                self._partrequested = True
+                if len(re.findall("^([^\r\n]*)", msg)[0]):
+                    self.context.raw("PART %s :%s" % (self.name, re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
+                else:
+                    self.context.raw("PART %s" % self.name, origin=origin)
+
+                ### Anticipated Numeric Replies:
+
+                ### ERR_NEEDMOREPARAMS ERR_NOSUCHCHANNEL
+                ### ERR_NOTONCHANNEL
+
+                if blocking:
+                    endtime = time.time() + timeout
+                    while True:
+                        self._parting.wait(max(0, endtime-time.time()))
+                        t = time.time()
+                        if not self.context.connected:
+                            raise NotConnected
+                        elif self._partreply == "PART":
+                            return
+                        elif type(self._partreply) == tuple and len(self._partreply) == 2:
+                            cmd, extinfo = self._partreply
+                            raise exceptcodes[cmd](extinfo)
+                        if t > endtime:
+                            raise RequestTimedOut
+            finally:
+                self._partrequested = False
+                self._partreply = None
 
     def invite(self, user, origin=None):
         nickname = user.nick if type(
@@ -1253,12 +1422,46 @@ class Channel(object):
             raise InvalidName
         self.context.raw("INVITE %s %s" % (nickname, self.name), origin=origin)
 
-    def join(self, key="", origin=None):
-        if len(re.findall("^([^\r\n\\s]*)", key)[0]):
-            self.context.raw("JOIN %s %s" % (self.name, re.findall(
-                "^([^\r\n\\s]*)", key)[0]), origin=origin)
-        else:
-            self.context.raw("JOIN %s" % self.name, origin=origin)
+    def join(self, key="", blocking=False, timeout=30, origin=None):
+        with self.context.lock:
+            if self.context.identity in self.users:
+                ### Bot is already on the channel
+                raise AlreadyJoined
+        with self._joining:
+            try:
+                if self._joinrequested:
+                    raise ActionAlreadyRequested
+                self._joinrequested = True
+                if len(re.findall("^([^\r\n\\s]*)", key)[0]):
+                    self.context.raw("JOIN %s %s" % (self.name, re.findall("^([^\r\n\\s]*)", key)[0]), origin=origin)
+                else:
+                    self.context.raw("JOIN %s" % self.name, origin=origin)
+
+                ### Anticipated Numeric Replies:
+
+                ### ERR_NEEDMOREPARAMS ERR_BANNEDFROMCHAN
+                ### ERR_INVITEONLYCHAN ERR_BADCHANNELKEY
+                ### ERR_CHANNELISFULL ERR_BADCHANMASK
+                ### ERR_NOSUCHCHANNEL ERR_TOOMANYCHANNELS
+                ### ERR_TOOMANYTARGETS ERR_UNAVAILRESOURCE
+
+                if blocking:
+                    endtime = time.time() + timeout
+                    while True:
+                        self._joining.wait(max(0, endtime-time.time()))
+                        t = time.time()
+                        if not self.context.connected:
+                            raise NotConnected
+                        elif self._joinreply == "JOIN":
+                            return
+                        elif type(self._joinreply) == tuple and len(self._joinreply) == 2:
+                            cmd, extinfo = self._joinreply
+                            raise exceptcodes[cmd](extinfo)
+                        if t > endtime:
+                            raise RequestTimedOut
+            finally:
+                self._joinrequested = False
+                self._joinreply = None
 
     def kick(self, user, msg="", origin=None):
         nickname = user.nick if type(
@@ -1278,7 +1481,7 @@ class Channel(object):
 
 class User(object):
     def __init__(self, nick, context):
-        if not re.match(r"^\S+$", nick):
+        if not re.match(r"^[A-Za-z\^\`\\\|\_\{\}\[\]][A-Za-z0-9\-\^\`\\\|\_\{\}\[\]]*$", nick):
             raise InvalidName
         self.nick = nick
         self.username = ""
