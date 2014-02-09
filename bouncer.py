@@ -12,16 +12,27 @@ import irc
 import getpass
 from threading import Thread, Lock
 import Queue
+import chardet
+
+# TODO: Rewrite this *entire* module and make more efficient.
 
 
 def BouncerReload(BNC):
     if BNC.isAlive():
         BNC.stop()
-    newBNC = Bouncer(addr=BNC.addr, port=BNC.port, ssl=BNC.ssl, ipv6=BNC.ipv6,
-                     certfile=BNC.certfile, keyfile=BNC.keyfile, timeout=BNC.timeout, autoaway=BNC.autoaway)
-    for label, (IRC, passwd, hashtype) in BNC.servers.items():
-        IRC.rmAddon(BNC)
-        IRC.addAddon(newBNC, label=label, passwd=passwd, hashtype=hashtype)
+    if BNC.__version__ == "1.2":
+        newBNC = Bouncer(
+            addr=BNC.addr, port=BNC.port, ssl=BNC.ssl, ipv6=BNC.ipv6,
+            certfile=BNC.certfile, keyfile=BNC.keyfile, timeout=BNC.timeout, autoaway=BNC.autoaway)
+        for label, (context, passwd, hashtype) in BNC.servers.items():
+            context.rmAddon(BNC)
+            context.addAddon(
+                newBNC, label=label, passwd=passwd, hashtype=hashtype)
+    else:
+        newBNC = Bouncer(**BNC.__options__)
+        for context, conf in BNC.conf.items():
+            context.rmAddon(BNC)
+            context.addAddon(newBNC, **conf.__dict__)
     return newBNC
 
 
@@ -29,13 +40,16 @@ class Bouncer (Thread):
 
     def __init__(self, addr="", port=16667, ssl=False, ipv6=False, certfile=None, keyfile=None, ignore=None, debug=False, timeout=300, autoaway=None):
         self.__name__ = "Bouncer for pyIRC"
-        self.__version__ = "1.2"
+        self.__version__ = "1.3"
         self.__author__ = "Brian Sherson"
-        self.__date__ = "December 26, 2013"
+        self.__date__ = "February 9, 2014"
+        self.__options__ = dict(
+            addr=addr, port=port, ssl=ssl, ipv6=ipv6, certfile=certfile,
+            keyfile=keyfile, ignore=ignore, debug=debug, timeout=timeout, autoaway=autoaway)
 
         self.addr = addr
         self.port = port
-        self.servers = {}
+        self.conf = {}
         self.passwd = {}
         self.socket = socket.socket(
             socket.AF_INET6 if ipv6 else socket.AF_INET)
@@ -54,9 +68,9 @@ class Bouncer (Thread):
 
         # Keep track of what extensions/connections are requesting WHO, WHOIS, and LIST, because we don't want to spam every bouncer connection with the server's replies.
         # In the future, MAY implement this idea in the irc module.
-        self.whoexpected = {}
-        self.whoisexpected = {}
-        self.listexpected = {}
+        self._whoexpected = {}
+        self._whoisexpected = {}
+        self._listexpected = {}
         self.lock = Lock()
         self.starttime = int(time.time())
         Thread.__init__(self)
@@ -95,7 +109,12 @@ class Bouncer (Thread):
         except:
             pass
 
-    def onAddonAdd(self, IRC, label, passwd=None, hashtype="sha512"):
+    def onAddonAdd(self, context, label, passwd=None, hashtype="sha512", ignore=None, autoaway=None, translations=None, hidden=None):
+        for (context2, conf2) in self.conf.items():
+            if context == context2:
+                raise ValueError, "Context already exists in config."
+            if label == conf2.label:
+                raise ValueError, "Unique label required."
         if passwd == None:
             while True:
                 passwd = getpass.getpass("Enter new password: ")
@@ -103,25 +122,24 @@ class Bouncer (Thread):
                     break
                 print "Passwords do not match!"
             passwd = hashlib.new(hashtype, passwd).hexdigest()
-        if IRC in [connection for (connection, p, h) in self.servers.values()]:
-            return  # Silently do nothing
-        if label in self.servers.keys():
-            return
-        self.servers[label] = (IRC, passwd, hashtype)
-        self.whoexpected[IRC] = []
+        conf = irc.Config(
+            label=label, passwd=passwd, hashtype=hashtype, ignore=ignore, autoaway=autoaway,
+            translations={} if translations == None else translations, hidden=irc.ChanList(hidden, context=context))
+        self.conf[context] = conf
+        self._whoexpected[context] = []
         if self.debug:
-            IRC.logwrite(
+            context.logwrite(
                 "dbg [Bouncer.onAddonAdd] Clearing WHO expected list." % vars())
-        self.whoisexpected[IRC] = []
-        self.listexpected[IRC] = []
+        self._whoisexpected[context] = []
+        self._listexpected[context] = []
 
-    def onAddonRem(self, IRC):
+    def onAddonRem(self, context):
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context:
                 bouncerconnection.quit(quitmsg="Bouncer extension removed")
-        for (label, (connection, passwd, hashtype)) in self.servers.items():
-            if connection == IRC:
-                del self.servers[label]
+        del self.conf[context]
+        del self._whoexpected[context], self._whoisexpected[
+            context], self._listexpected[context]
 
     def stop(self):
         self._stopexpected = True
@@ -129,256 +147,340 @@ class Bouncer (Thread):
 
     def disconnectall(self, quitmsg="Disconnecting all sessions"):
         for bouncerconnection in self.connections:
-            bouncerconnection.stop(quitmsg=quitmsg)
+            bouncerconnection.quit(quitmsg=quitmsg)
 
-    def onDisconnect(self, IRC, expected=False):
-        self.whoexpected[IRC] = []
-        self.whoisexpected[IRC] = []
-        self.listexpected[IRC] = []
+    def onDisconnect(self, context, expected=False):
+        self._whoexpected[context] = []
+        self._whoisexpected[context] = []
+        self._listexpected[context] = []
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
-                #bouncerconnection.quit(quitmsg="IRC connection lost")
-                for channel in IRC.identity.channels:
-                    bouncerconnection.send(":%s!%s@%s PART %s :Bouncer Connection Lost\n" % (
-                        IRC.identity.nick, IRC.identity.username, IRC.identity.host, channel.name))
-                bouncerconnection.send(
-                    ":%s!%s@%s QUIT :Bouncer Connection Lost\n" %
-                    (IRC.identity.nick, IRC.identity.username, IRC.identity.host))
+            if bouncerconnection.context == context:
+                #bouncerconnection.quit(quitmsg="context connection lost")
+                if context.identity:
+                    for channel in context.identity.channels:
+                        bouncerconnection.send(":%s!%s@%s PART %s :Bouncer Connection Lost\n" % (
+                            context.identity.nick, context.identity.username, context.identity.host, channel.name))
+                    bouncerconnection.send(":%s!%s@%s QUIT :Bouncer Connection Lost\n" % (
+                        context.identity.nick, context.identity.username, context.identity.host))
                 bouncerconnection.send(
                     ":*Bouncer* NOTICE %s :Connection to %s:%s has been lost.\n" %
-                    (bouncerconnection.nick, IRC.server, IRC.port))
+                    (bouncerconnection.nick, context.server, context.port))
 
-    def onQuit(self, IRC, user, quitmsg):
-        # For some odd reason, certain networks (*cough*Freenode*cough*) will send a quit message for the user, causing IRC.identity.channels to be cleared
+    def onQuit(self, context, user, quitmsg):
+        # For some odd reason, certain networks (*cough*Freenode*cough*) will send a quit message for the user, causing context.identity.channels to be cleared
         # before onDisconnect can be executed. This is the remedy.
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context:
                 if quitmsg:
                     bouncerconnection.send(":%s!%s@%s QUIT :%s\n" % (
                         user.nick, user.username, user.host, quitmsg))
                 else:
                     bouncerconnection.send(
                         ":%s!%s@%s QUIT\n" % (user.nick, user.username, user.host))
-                if user == IRC.identity:
-                    for channel in IRC.identity.channels:
+                if user == context.identity:
+                    for channel in context.identity.channels:
                         bouncerconnection.send(":%s!%s@%s PART %s :Bouncer Connection Lost\n" % (
-                            IRC.identity.nick, IRC.identity.username, IRC.identity.host, channel.name))
+                            context.identity.nick, context.identity.username, context.identity.host, channel.name))
 
-    def onConnectAttempt(self, IRC):
+    def onConnectAttempt(self, context):
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context:
                 bouncerconnection.send(
                     ":*Bouncer* NOTICE %s :Attempting connection to %s:%s.\n" %
-                    (bouncerconnection.nick, IRC.server, IRC.port))
+                    (bouncerconnection.nick, context.server, context.port))
 
-    def onConnect(self, IRC):
+    def onConnect(self, context):
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context:
                 bouncerconnection.send(
                     ":*Bouncer* NOTICE %s :Connection to %s:%s established.\n" %
-                    (bouncerconnection.nick, IRC.server, IRC.port))
+                    (bouncerconnection.nick, context.server, context.port))
 
-    def onMeNickChange(self, IRC, newnick):
+    def onMeNickChange(self, context, newnick):
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context:
                 bouncerconnection.send(":%s!%s@%s NICK %s\n" %
-                                       (IRC.identity.nick, IRC.identity.username, IRC.identity.host, newnick))
+                                       (context.identity.nick, context.identity.username, context.identity.host, newnick))
                 bouncerconnection.nick = newnick
 
-    def onRegistered(self, IRC):
+    def onNickChange(self, context, user, newnick):
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
-                if bouncerconnection.nick != IRC.identity.nick:
-                    bouncerconnection.send(":%s!%s@%s NICK %s\n" % (
-                        bouncerconnection.nick, bouncerconnection.username, bouncerconnection.host, IRC.identity.nick))
-                    bouncerconnection.nick = IRC.identity.nick
+            if bouncerconnection.context == context:
+                bouncerconnection.send(":%s!%s@%s NICK %s\n" %
+                                       (user.nick, user.username, user.host, newnick))
+                bouncerconnection.nick = newnick
 
-    def onConnectFail(self, IRC, exc, excmsg, tb):
+    def onRegistered(self, context):
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context:
+                if bouncerconnection.nick != context.identity.nick:
+                    bouncerconnection.send(":%s!%s@%s NICK %s\n" % (
+                        bouncerconnection.nick, bouncerconnection.username, bouncerconnection.host, context.identity.nick))
+                    bouncerconnection.nick = context.identity.nick
+
+    def onConnectFail(self, context, exc, excmsg, tb):
+        for bouncerconnection in self.connections:
+            if bouncerconnection.context == context:
                 bouncerconnection.send(
                     ":*Bouncer* NOTICE %s :Connection to %s:%s failed: %s.\n" %
-                    (bouncerconnection.nick, IRC.server, IRC.port, excmsg))
+                    (bouncerconnection.nick, context.server, context.port, excmsg))
 
-    def onSendChanMsg(self, IRC, origin, channel, targetprefix, msg):
+    def onSendChanMsg(self, context, origin, channel, targetprefix, msg):
         # Called when bot sends a PRIVMSG to channel.
         # The variable origin refers to a class instance voluntarily
         # identifying itself as that which requested data be sent.
+        conf = self.conf[context]
+        if channel in conf.translations.keys():
+            channame = conf.translations[channel]
+        else:
+            channame = channel.name
         for bouncerconnection in self.connections:
-            if IRC == bouncerconnection.IRC and origin != bouncerconnection:
-                bouncerconnection.send(":%s!%s@%s PRIVMSG %s%s :%s\n" %
-                                       (IRC.identity.nick, IRC.identity.username, IRC.identity.host, targetprefix, channel.name, msg))
+            if context == bouncerconnection.context and origin != bouncerconnection and channel not in bouncerconnection.hidden:
+                bouncerconnection.send(":%s!%s@%s PRIVMSG %s%s :%s\n" % (
+                    context.identity.nick, context.identity.username, context.identity.host, targetprefix, channame, msg))
 
-    def onSendChanAction(self, IRC, origin, channel, targetprefix, action):
+    def onSendChanAction(self, context, origin, channel, targetprefix, action):
         self.onSendChanMsg(
-            IRC, origin, channel, targetprefix, "\x01ACTION %s\x01" % action)
+            context, origin, channel, targetprefix, "\x01ACTION %s\x01" % action)
 
-    def onSendChanNotice(self, IRC, origin, channel, targetprefix, msg):
+    def onSendChanNotice(self, context, origin, channel, targetprefix, msg):
         # Called when bot sends a NOTICE to channel.
         # The variable origin refers to a class instance voluntarily
         # identifying itself as that which requested data be sent.
+        conf = self.conf[context]
+        if channel in conf.translations.keys():
+            channame = conf.translations[channel]
+        else:
+            channame = channel.name
         for bouncerconnection in self.connections:
-            if IRC == bouncerconnection.IRC and origin != bouncerconnection:
-                bouncerconnection.send(":%s!%s@%s NOTICE %s%s :%s\n" % (
-                    IRC.identity.nick, IRC.identity.username, IRC.identity.host, targetprefix, channel.name, msg))
+            if context == bouncerconnection.context and origin != bouncerconnection:
+                bouncerconnection.send(":%s!%s@%s NOTICE %s%s :%s\n" %
+                                       (context.identity.nick, context.identity.username, context.identity.host, targetprefix, channame, msg))
 
-    def onSend(self, IRC, origin, line, cmd, target, params, extinfo):
+    def onSend(self, context, origin, line, cmd, target, params, extinfo):
         if cmd.upper() == "WHO":
-            self.whoexpected[IRC].append(origin)
+            self._whoexpected[context].append(origin)
             if self.debug:
                 if issubclass(type(origin), Thread):
                     name = origin.name
-                    IRC.logwrite(
+                    context.logwrite(
                         "dbg [Bouncer.onSend] Adding %(origin)s (%(name)s) to WHO expected list." % vars())
                 else:
-                    IRC.logwrite(
+                    context.logwrite(
                         "dbg [Bouncer.onSend] Adding %(origin)s to WHO expected list." % vars())
-                IRC.logwrite(
-                    "dbg [Bouncer.onSend] WHO expected list size: %d" %
-                    len(self.whoexpected[IRC]))
+                context.logwrite(
+                    "dbg [Bouncer.onSend] WHO expected list size: %d" % len(self._whoexpected[context]))
         elif cmd.upper() == "WHOIS":
-            self.whoisexpected[IRC].append(origin)
+            self._whoisexpected[context].append(origin)
         elif cmd.upper() == "LIST":
-            self.listexpected[IRC].append(origin)
+            self._listexpected[context].append(origin)
 
-    def onWhoEntry(self, IRC, origin, channel, user, channame, username, host, serv, nick, flags, hops, realname):
+    def onWhoEntry(self, context, origin, channel, user, channame, username, host, serv, nick, flags, hops, realname):
         # Called when a WHO list is received.
-        if len(self.whoexpected[IRC]) and self.whoexpected[IRC][0] in self.connections:
-            bncconnection = self.whoexpected[IRC][0]
+        conf = self.conf[context]
+        if context.channel(channame) in conf.translations.keys():
+            channame = conf.translations[context.channel(channame)]
+        if len(self._whoexpected[context]) and self._whoexpected[context][0] in self.connections:
+            bncconnection = self._whoexpected[context][0]
             bncconnection.send(":%s 352 %s %s %s %s %s %s %s :%s %s\n" %
-                               (origin, IRC.identity.nick, channame, username, host, serv, nick, flags, hops, realname))
+                               (origin, context.identity.nick, channame, username, host, serv, nick, flags, hops, realname))
 
-    def onWhoEnd(self, IRC, origin, param, endmsg):
+    def onWhoEnd(self, context, origin, param, endmsg):
         # Called when a WHO list is received.
-        if len(self.whoexpected[IRC]) and self.whoexpected[IRC][0] in self.connections:
-            bncconnection = self.whoexpected[IRC][0]
+        try:
+            conf = self.conf[context]
+            chantypes = context.supports.get("CHANTYPES", "&#+!")
+            if re.match(irc._chanmatch % re.escape(chantypes), param) and context[param] in conf.translations.keys():
+                param = conf.translations[context.channel(param)]
+        except:
+            pass
+        if len(self._whoexpected[context]) and self._whoexpected[context][0] in self.connections:
+            bncconnection = self._whoexpected[context][0]
             bncconnection.send(":%s 315 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, param, endmsg))
+                               (origin, context.identity.nick, param, endmsg))
         if self.debug:
-            if issubclass(type(self.whoexpected[IRC][0]), Thread):
-                name = self.whoexpected[IRC][0].name
-                IRC.logwrite(
+            if issubclass(type(self._whoexpected[context][0]), Thread):
+                name = self._whoexpected[context][0].name
+                context.logwrite(
                     "dbg [Bouncer.onWhoEnd] Removing %s (%s) from WHO expected list." %
-                    (self.whoexpected[IRC][0], name))
+                    (self._whoexpected[context][0], name))
             else:
-                IRC.logwrite(
-                    "dbg [Bouncer.onWhoEnd] Removing %s from WHO expected list." % self.whoexpected[IRC][0])
-        del self.whoexpected[IRC][0]
+                context.logwrite(
+                    "dbg [Bouncer.onWhoEnd] Removing %s from WHO expected list." % self._whoexpected[context][0])
+        del self._whoexpected[context][0]
         if self.debug:
-            IRC.logwrite("dbg [Bouncer.onWhoEnd] WHO expected list size: %d" %
-                         len(self.whoexpected[IRC]))
+            context.logwrite(
+                "dbg [Bouncer.onWhoEnd] WHO expected list size: %d" %
+                len(self._whoexpected[context]))
 
-    def onListStart(self, IRC, origin, params, extinfo):
+    def onListStart(self, context, origin, params, extinfo):
         # Called when a WHO list is received.
-        if len(self.listexpected[IRC]) and self.listexpected[IRC][0] in self.connections:
-            bncconnection = self.listexpected[IRC][0]
+        if len(self._listexpected[context]) and self._listexpected[context][0] in self.connections:
+            bncconnection = self._listexpected[context][0]
             bncconnection.send(":%s 321 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, params, extinfo))
+                               (origin, context.identity.nick, params, extinfo))
 
-    def onListEntry(self, IRC, origin, channel, population, extinfo):
+    def onListEntry(self, context, origin, channel, population, extinfo):
         # Called when a WHO list is received.
-        if len(self.listexpected[IRC]) and self.listexpected[IRC][0] in self.connections:
-            bncconnection = self.listexpected[IRC][0]
+        conf = self.conf[context]
+        if channel in conf.translations.keys():
+            channame = conf.translations[channel]
+        else:
+            channame = channel.name
+        if len(self._listexpected[context]) and self._listexpected[context][0] in self.connections:
+            bncconnection = self._listexpected[context][0]
             bncconnection.send(":%s 322 %s %s %d :%s\n" %
-                               (origin, IRC.identity.nick, channel.name, population, extinfo))
+                               (origin, context.identity.nick, channame, population, extinfo))
 
-    def onListEnd(self, IRC, origin, endmsg):
+    def onListEnd(self, context, origin, endmsg):
         # Called when a WHO list is received.
-        if len(self.listexpected[IRC]) and self.listexpected[IRC][0] in self.connections:
-            bncconnection = self.listexpected[IRC][0]
+        if len(self._listexpected[context]) and self._listexpected[context][0] in self.connections:
+            bncconnection = self._listexpected[context][0]
             bncconnection.send(":%s 323 %s :%s\n" %
-                               (origin, IRC.identity.nick, endmsg))
-        del self.listexpected[IRC][0]
+                               (origin, context.identity.nick, endmsg))
+        del self._listexpected[context][0]
 
-    def onWhoisStart(self, IRC, origin, user, nickname, username, host, realname):
+    def onWhoisStart(self, context, origin, user, nickname, username, host, realname):
         # Called when a WHOIS reply is received.
-        if len(self.whoisexpected[IRC]):
-            if self.whoisexpected[IRC][0] in self.connections:
-                bncconnection = self.whoisexpected[IRC][0]
+        if len(self._whoisexpected[context]):
+            if self._whoisexpected[context][0] in self.connections:
+                bncconnection = self._whoisexpected[context][0]
                 bncconnection.send(":%s 311 %s %s %s %s * :%s\n" %
-                                   (origin, IRC.identity.nick, nickname, username, host, realname))
+                                   (origin, context.identity.nick, nickname, username, host, realname))
 
-    def onWhoisRegisteredNick(self, IRC, origin, user, nickname, msg):
+    def onWhoisRegisteredNick(self, context, origin, user, nickname, msg):
         # Called when a WHOIS reply is received.
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 307 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
+                               (origin, context.identity.nick, nickname, msg))
 
-    def onWhoisConnectingFrom(self, IRC, origin, user, nickname, msg):
+    def onWhoisConnectingFrom(self, context, origin, user, nickname, msg):
         # Called when a WHOIS reply is received.
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 378 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
+                               (origin, context.identity.nick, nickname, msg))
 
-    def onWhoisChannels(self, IRC, origin, user, nickname, chanlist):
+    def onWhoisChannels(self, context, origin, user, nickname, chanlist):
         # Called when a WHOIS reply is received.
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+        # TODO: Translations implementation
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 319 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, " ".join(chanlist)))
+                               (origin, context.identity.nick, nickname, " ".join(chanlist)))
 
-    def onWhoisAvailability(self, IRC, origin, user, nickname, msg):
+    def onWhoisAvailability(self, context, origin, user, nickname, msg):
         # Called when a WHOIS reply is received.
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 310 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
+                               (origin, context.identity.nick, nickname, msg))
 
-    def onWhoisServer(self, IRC, origin, user, nickname, server, servername):
+    def onWhoisServer(self, context, origin, user, nickname, server, servername):
         # Called when a WHOIS reply is received.
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 312 %s %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, server, servername))
+                               (origin, context.identity.nick, nickname, server, servername))
 
-    def onWhoisOp(self, IRC, origin, user, nickname, msg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisOp(self, context, origin, user, nickname, msg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 313 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
+                               (origin, context.identity.nick, nickname, msg))
 
-    def onWhoisAway(self, IRC, origin, user, nickname, awaymsg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisAway(self, context, origin, user, nickname, awaymsg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 301 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, awaymsg))
+                               (origin, context.identity.nick, nickname, awaymsg))
 
-    def onWhoisTimes(self, IRC, origin, user, nickname, idletime, signontime, msg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisTimes(self, context, origin, user, nickname, idletime, signontime, msg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 317 %s %s %d %d :%s\n" %
-                               (origin, IRC.identity.nick, nickname, idletime, signontime, msg))
+                               (origin, context.identity.nick, nickname, idletime, signontime, msg))
 
-    def onWhoisSSL(self, IRC, origin, user, nickname, msg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisSSL(self, context, origin, user, nickname, msg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 671 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
+                               (origin, context.identity.nick, nickname, msg))
 
-    def onWhoisModes(self, IRC, origin, user, nickname, msg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisModes(self, context, origin, user, nickname, msg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 339 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
+                               (origin, context.identity.nick, nickname, msg))
 
-    def onWhoisLoggedInAs(self, IRC, origin, user, nickname, loggedinas, msg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisLoggedInAs(self, context, origin, user, nickname, loggedinas, msg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 330 %s %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, loggedinas, msg))
+                               (origin, context.identity.nick, nickname, loggedinas, msg))
 
-    def onWhoisEnd(self, IRC, origin, user, nickname, msg):
-        if len(self.whoisexpected[IRC]) and self.whoisexpected[IRC][0] in self.connections:
-            bncconnection = self.whoisexpected[IRC][0]
+    def onWhoisEnd(self, context, origin, user, nickname, msg):
+        if len(self._whoisexpected[context]) and self._whoisexpected[context][0] in self.connections:
+            bncconnection = self._whoisexpected[context][0]
             bncconnection.send(":%s 318 %s %s :%s\n" %
-                               (origin, IRC.identity.nick, nickname, msg))
-        del self.whoisexpected[IRC][0]
+                               (origin, context.identity.nick, nickname, msg))
+        del self._whoisexpected[context][0]
 
-    def onUnhandled(self, IRC, line, origin, cmd, target, params, extinfo):
+    def onJoin(self, context, user, channel):
+        conf = self.conf[context]
+        if channel in conf.translations.keys():
+            channame = conf.translations[channel]
+        else:
+            channame = channel.name
+        line = ":%s!%s@%s JOIN %s" % (
+            user.nick, user.username, user.host, channame)
         for bouncerconnection in self.connections:
-            if bouncerconnection.IRC == IRC:
+            if bouncerconnection.context == context and channel not in bouncerconnection.hidden:
+                bouncerconnection.send("%s\n" % line)
+
+    def onUnhandled(self, context, line, origin, cmd, target, params, extinfo, targetprefix):
+        conf = self.conf[context]
+
+        if type(origin) == irc.User:
+            origin = "%s!%s@%s" % (origin.nick, origin.username, origin.host)
+
+        if target in conf.translations.keys():
+            target = conf.translations[target]
+
+        chantarg = None
+
+        if type(target) == irc.User:
+            target = target.nick
+        elif type(target) == irc.Channel:
+            chantarg = target
+            target = target.name
+
+        if params:  # Channels which appear in params
+            oldparams = params
+            params = []
+            for param in oldparams.split():
+                chantypes = context.supports.get("CHANTYPES", "&#+!")
+                if re.match(irc._chanmatch % re.escape(chantypes), param) and context[param] in conf.translations.keys():
+                    params.append(conf.translations[context[param]])
+                else:
+                    params.append(param)
+
+        if target:
+            if type(cmd) == int:
+                cmd = "%03d" % cmd
+            if params and extinfo:
+                line = ":%s %s %s %s :%s" % (
+                    origin, cmd, target, " ".join(params), extinfo)
+            elif params:
+                line = ":%s %s %s %s" % (origin, cmd, target, " ".join(params))
+            elif extinfo:
+                line = ":%s %s %s :%s" % (origin, cmd, target, extinfo)
+            else:
+                line = ":%s %s %s" % (origin, cmd, target)
+
+        for bouncerconnection in self.connections:
+            if bouncerconnection.context == context and chantarg not in bouncerconnection.hidden:
                 bouncerconnection.send("%s\n" % line)
 
 
@@ -389,7 +491,7 @@ class BouncerConnection (Thread):
         self.bouncer = bouncer
         self.connection = connection
         self.host, self.port = self.addr = addr[:2]
-        self.IRC = None
+        self.context = None
         self.pwd = None
         self.nick = None
         self.label = None
@@ -400,6 +502,7 @@ class BouncerConnection (Thread):
         self.lock = Lock()
         self.quitmsg = "Connection Closed"
         self.quitting = False
+        self.hidden = irc.ChanList()
 
         Thread.__init__(self)
         self.daemon = True
@@ -408,29 +511,29 @@ class BouncerConnection (Thread):
     def send(self, data, flags=0):
         try:
             with self.lock:
-                self.connection.send(data)
+                self.connection.send(data.encode("utf8"))
         except socket.error:
             exc, excmsg, tb = sys.exc_info()
-            print >>self.IRC.logwrite(*["!!! [BouncerConnection.send] Exception in thread %(self)s" % vars()] + [
-                                      "!!! [BouncerConnection.send] %(tbline)s" % vars() for tbline in traceback.format_exc().split("\n")])
+            print >>self.context.logwrite(*["!!! [BouncerConnection.send] Exception in thread %(self)s" % vars()] + [
+                                          "!!! [BouncerConnection.send] %(tbline)s" % vars() for tbline in traceback.format_exc().split("\n")])
             self.quit(quitmsg=excmsg.message)
 
     def __repr__(self):
-        server = self.IRC.server if self.IRC else "*"
-        port = self.IRC.port if self.IRC else "*"
-        if self.IRC and self.IRC.identity:
-            nick = self.IRC.identity.nick
-            ident = self.IRC.identity.username if self.IRC.identity.username else "*"
-            host = self.IRC.identity.host if self.IRC.identity.host else "*"
+        server = self.context.server if self.context else "*"
+        port = self.context.port if self.context else "*"
+        if self.context and self.context.identity:
+            nick = self.context.identity.nick
+            ident = self.context.identity.username if self.context.identity.username else "*"
+            host = self.context.identity.host if self.context.identity.host else "*"
         else:
             nick = "*"
             ident = "*"
             host = "*"
-        if self.IRC.ssl and self.IRC.ipv6:
+        if self.context.ssl and self.context.ipv6:
             protocol = "ircs6"
-        elif self.IRC.ssl:
+        elif self.context.ssl:
             protocol = "ircs"
-        elif self.IRC.ipv6:
+        elif self.context.ipv6:
             protocol = "irc6"
         else:
             protocol = "irc"
@@ -443,7 +546,7 @@ class BouncerConnection (Thread):
             with self.lock:
                 try:
                     self.connection.send("ERROR :Closing link: (%s@%s) [%s]\n" % (
-                        self.IRC.identity.nick if self.IRC else "*", self.host, quitmsg))
+                        self.context.identity.nick if self.context else "*", self.host, quitmsg))
                 except:
                     pass
                 try:
@@ -506,8 +609,15 @@ class BouncerConnection (Thread):
                         readbuf = readbuf[lastlf + 1:]
 
                 line = string.rstrip(linebuf.pop(0))
+                try:
+                    line = line.decode("utf8")
+                except UnicodeDecodeError:
+                    # Attempt to figure encoding
+                    charset = chardet.detect(line)['encoding']
+                    line = line.decode(charset)
                 match = re.findall(
                     "^(.+?)(?:\\s+(.+?)(?:\\s+(.+?))??)??(?:\\s+:(.*))?$", line, re.I)
+                # print match
 
                 if len(match) == 0:
                     continue
@@ -532,118 +642,206 @@ class BouncerConnection (Thread):
                 elif not self.username:  # Bouncer expects a USER command to finish registration
                     if cmd.upper() == "USER":
                         self.username = target
-                        # print self.username
-                        if self.username in self.bouncer.servers.keys():
-                            self.IRC, passwdhash, hashtype = self.bouncer.servers[
-                                self.username]
-                            passmatch = hashlib.new(
-                                hashtype, passwd).hexdigest() == passwdhash
-                            with self.IRC.lock:
-                                if not passmatch:
-                                    self.quit("Access Denied")
-                                    self.IRC.logwrite(
-                                        "*** [BouncerConnection] Incoming connection from %s to %s denied: Invalid password." % (self.host, self.IRC))
-                                    for bouncerconnection in self.bouncer.connections:
-                                        if bouncerconnection.IRC != self.IRC:
-                                            continue
-                                        if not bouncerconnection.quitting:
-                                            bouncerconnection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s dened: Invalid password.\n" % (
-                                                bouncerconnection.IRC.identity.nick, self.host, self.IRC))
-                                    break
+                        contextfound = False
+                        for self.context, conf in self.bouncer.conf.items():
+                            # print conf.label, self.username
+                            if conf.label == self.username:
+                                contextfound = True
+                                break
+                        if not contextfound:
+                            with self.context.lock:
+                                self.quit("Access Denied")
+                                self.context.logwrite(
+                                    "*** [BouncerConnection] Incoming connection from %s to %s denied: Invalid password." % (self.host, self.context))
+                                for bouncerconnection in self.bouncer.connections:
+                                    if bouncerconnection.context != self.context:
+                                        continue
+                                    if not bouncerconnection.quitting:
+                                        bouncerconnection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s dened: Invalid password.\n" % (
+                                            bouncerconnection.context.identity.nick, self.host, self.context))
+                                break
+                        passmatch = hashlib.new(
+                            conf.hashtype, passwd).hexdigest() == conf.passwd
+                        with self.context.lock:
+                            if not passmatch:
+                                self.quit("Access Denied")
+                                self.context.logwrite(
+                                    "*** [BouncerConnection] Incoming connection from %s to %s denied: Invalid password." % (self.host, self.context))
+                                for bouncerconnection in self.bouncer.connections:
+                                    if bouncerconnection.context != self.context:
+                                        continue
+                                    if not bouncerconnection.quitting:
+                                        bouncerconnection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s dened: Invalid password.\n" % (
+                                            bouncerconnection.context.identity.nick, self.host, self.context))
+                                break
 
-                                self.IRC.logwrite(
-                                    "*** [BouncerConnection] Incoming connection from %s to %s." % (self.host, self.IRC))
-                                with self.bouncer.lock:
-                                    # Announce connection to all other bouncer
-                                    # connections.
-                                    for bouncerconnection in self.bouncer.connections:
-                                        if bouncerconnection.IRC != self.IRC:
-                                            continue
-                                        if not bouncerconnection.quitting:
-                                            bouncerconnection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s\n" % (
-                                                bouncerconnection.IRC.identity.nick, self.host, self.IRC))
-                                    if len([bncconnection for bncconnection in self.bouncer.connections if bncconnection.IRC == self.IRC]) == 0 and self.IRC.registered and type(self.IRC.identity) == irc.User and self.IRC.identity.away:
-                                        # Bouncer connection should
-                                        # automatically return from away
-                                        # status.
-                                        self.IRC.raw("AWAY")
-                                    self.bouncer.connections.append(self)
+                            self.context.logwrite(
+                                "*** [BouncerConnection] Incoming connection from %s to %s." % (self.host, self.context))
+                            with self.bouncer.lock:
+                                # Announce connection to all other bouncer
+                                # connections.
+                                for bouncerconnection in self.bouncer.connections:
+                                    if bouncerconnection.context != self.context:
+                                        continue
+                                    if not bouncerconnection.quitting:
+                                        bouncerconnection.send(":*Bouncer* NOTICE %s :Incoming connection from %s to %s\n" % (
+                                            bouncerconnection.context.identity.nick, self.host, self.context))
+                                if len([bncconnection for bncconnection in self.bouncer.connections if bncconnection.context == self.context]) == 0 and self.context.registered and type(self.context.identity) == irc.User and self.context.identity.away:
+                                    # Bouncer connection should automatically
+                                    # return from away status.
+                                    self.context.raw("AWAY")
+                                self.hidden = irc.ChanList(
+                                    self.bouncer.conf[self.context].hidden, context=self.context)
+                                self.bouncer.connections.append(self)
 
-                                if self.IRC.registered:
-                                    # Send Greeting.
-                                    with self.lock:
-                                        if self.IRC.welcome:
-                                            self.connection.send(":%s 001 %s :%s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, self.IRC.welcome))
-                                        if self.IRC.hostinfo:
-                                            self.connection.send(":%s 002 %s :%s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, self.IRC.hostinfo))
-                                        if self.IRC.servcreated:
-                                            self.connection.send(":%s 003 %s :%s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, self.IRC.servcreated))
-                                        if self.IRC.servinfo:
-                                            self.connection.send(":%s 004 %s %s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, self.IRC.servinfo))
+                            if self.context.registered:
+                                # Send Greeting.
+                                with self.lock:
+                                    if self.context.welcome:
+                                        self.connection.send(
+                                            (u":%s 001 %s :%s\n" % (self.context.serv, self.context.identity.nick, self.context.welcome)).encode("utf8"))
+                                    if self.context.hostinfo:
+                                        self.connection.send(
+                                            (u":%s 002 %s :%s\n" % (self.context.serv, self.context.identity.nick, self.context.hostinfo)).encode("utf8"))
+                                    if self.context.servcreated:
+                                        self.connection.send(
+                                            (u":%s 003 %s :%s\n" % (self.context.serv, self.context.identity.nick, self.context.servcreated)).encode("utf8"))
+                                    if self.context.servinfo:
+                                        self.connection.send(
+                                            (u":%s 004 %s %s\n" % (self.context.serv, self.context.identity.nick, self.context.servinfo)).encode("utf8"))
 
-                                        # Send 005 response.
-                                        if self.IRC.supports:
-                                            supports = ["CHANMODES=%s" % (",".join(value)) if name == "CHANMODES" else "PREFIX=(%s)%s" % value if name == "PREFIX" else "%s=%s" % (
-                                                name, value) if value else name for name, value in self.IRC.supports.items()]
-                                            supports.sort()
-                                            supportsreply = []
-                                            supportsstr = " ".join(supports)
-                                            index = 0
-                                            while True:
-                                                if len(supportsstr) - index > 196:
-                                                    nextindex = supportsstr.rfind(
-                                                        " ", index, index + 196)
-                                                    supportsreply.append(
-                                                        supportsstr[index:nextindex])
-                                                    index = nextindex + 1
-                                                else:
-                                                    supportsreply.append(
-                                                        supportsstr[index:])
-                                                    break
-                                            for support in supportsreply:
-                                                self.connection.send(":%s 005 %s %s :are supported by this server\n" % (
-                                                    self.IRC.serv, self.IRC.identity.nick, support))
+                                    # Send 005 response.
+                                    if self.context.supports:
+                                        supports = ["CHANMODES=%s" % (",".join(value)) if name == "CHANMODES" else "PREFIX=(%s)%s" % value if name == "PREFIX" else "%s=%s" % (
+                                            name, value) if value else name for name, value in self.context.supports.items()]
+                                        supports.sort()
+                                        supportsreply = []
+                                        supportsstr = " ".join(supports)
+                                        index = 0
+                                        while True:
+                                            if len(supportsstr) - index > 196:
+                                                nextindex = supportsstr.rfind(
+                                                    " ", index, index + 196)
+                                                supportsreply.append(
+                                                    supportsstr[index:nextindex])
+                                                index = nextindex + 1
+                                            else:
+                                                supportsreply.append(
+                                                    supportsstr[index:])
+                                                break
+                                        for support in supportsreply:
+                                            self.connection.send((u":%s 005 %s %s :are supported by this server\n" % (
+                                                self.context.serv, self.context.identity.nick, support)).encode("utf8"))
 
-                                        # Send MOTD
-                                        if self.IRC.motdgreet and self.IRC.motd and self.IRC.motdend:
-                                            self.connection.send(":%s 375 %s :%s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, self.IRC.motdgreet))
-                                            for motdline in self.IRC.motd:
-                                                self.connection.send(":%s 372 %s :%s\n" % (
-                                                    self.IRC.serv, self.IRC.identity.nick, motdline))
-                                            try:
-                                                self.connection.send(":%s 376 %s :%s\n" % (
-                                                    self.IRC.serv, self.IRC.identity.nick, self.IRC.motdend))
-                                            except AttributeError:
-                                                self.connection.send(
-                                                    ":%s 376 %s\n" % (self.IRC.serv, self.IRC.identity.nick))
-                                        else:
+                                    # Send MOTD
+                                    if self.context.motdgreet and self.context.motd and self.context.motdend:
+                                        self.connection.send(
+                                            (u":%s 375 %s :%s\n" % (self.context.serv, self.context.identity.nick, self.context.motdgreet)).encode("utf8"))
+                                        for motdline in self.context.motd:
                                             self.connection.send(
-                                                ":%s 422 %s :MOTD File is missing\n" % (self.IRC.serv, self.IRC.identity.nick))
+                                                (u":%s 372 %s :%s\n" % (self.context.serv, self.context.identity.nick, motdline)).encode("utf8"))
+                                        try:
+                                            self.connection.send(
+                                                (u":%s 376 %s :%s\n" % (self.context.serv, self.context.identity.nick, self.context.motdend)).encode("utf8"))
+                                        except AttributeError:
+                                            self.connection.send(
+                                                (u":%s 376 %s\n" % (self.context.serv, self.context.identity.nick)).encode("utf8"))
+                                    else:
+                                        self.connection.send((u":%s 422 %s :MOTD File is missing\n" % (
+                                            self.context.serv, self.context.identity.nick)).encode("utf8"))
 
-                                        # Send user modes and snomasks.
-                                        self.connection.send(":%s 221 %s +%s\n" % (
-                                            self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.modes))
+                                    # Send user modes and snomasks.
+                                    self.connection.send(
+                                        (u":%s 221 %s +%s\n" % (self.context.serv, self.context.identity.nick, self.context.identity.modes)).encode("utf8"))
 
-                                        if "s" in self.IRC.identity.modes and self.IRC.identity.snomask:
-                                            self.connection.send(":%s 008 %s +%s :Server notice mask\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.snomask))
+                                    if "s" in self.context.identity.modes and self.context.identity.snomask:
+                                        self.connection.send((u":%s 008 %s +%s :Server notice mask\n" % (
+                                            self.context.serv, self.context.identity.nick, self.context.identity.snomask)).encode("utf8"))
 
-                                        # Join user to channels.
-                                        for channel in self.IRC.identity.channels:
+                                    # Join user to channels.
+                                    for channel in self.context.identity.channels:
+                                        if channel in self.hidden:
+                                            continue
+
+                                        if channel in conf.translations.keys():
+                                            channame = conf.translations[
+                                                channel]
+                                        else:
+                                            channame = channel.name
+                                        # JOIN command
+                                        self.connection.send(
+                                            (u":%s!%s@%s JOIN :%s\n" % (self.context.identity.nick, self.context.identity.username, self.context.identity.host, channame)).encode("utf8"))
+
+                                        # Topic
+                                        self.connection.send(
+                                            (u":%s 332 %s %s :%s\n" % (self.context.serv, self.context.identity.nick, channame, channel.topic)).encode("utf8"))
+                                        self.connection.send((u":%s 333 %s %s %s %s\n" % (self.context.serv, self.context.identity.nick, channame, channel.topicsetby.nick if type(
+                                            channel.topicsetby) == irc.User else channel.topicsetby, channel.topictime)).encode("utf8"))
+
+                                        # Determine if +s or +p modes are set
+                                        # in channel
+                                        secret = "s" in channel.modes.keys() and channel.modes[
+                                            "s"]
+                                        private = "p" in channel.modes.keys(
+                                        ) and channel.modes["p"]
+
+                                        # Construct NAMES for channel.
+                                        namesusers = []
+                                        modes, symbols = self.context.supports[
+                                            "PREFIX"]
+                                        self.connection.send((u":%s 353 %s %s %s :%s\n" % (
+                                            self.context.serv,
+                                            self.context.identity.nick,
+                                            "@" if secret else (
+                                                "*" if private else "="),
+                                            channame,
+                                            u" ".join([u"".join([symbols[k] if modes[k] in channel.modes.keys() and user in channel.modes[modes[k]] else "" for k in xrange(len(modes))]) + user.nick for user in channel.users]))
+                                        ).encode("utf8"))
+                                        self.connection.send((u":%s 366 %s %s :End of /NAMES list.\n" % (
+                                            self.context.serv, self.context.identity.nick, channame)).encode("utf8"))
+                            else:
+                                self.send(
+                                    u":*Bouncer* NOTICE %s :Not connected to server. Type /bncconnect to attempt connection.\n" % self.nick)
+                                self.send(
+                                    u":%s 001 %s :Welcome to the Bouncer context Network %s!%s@%s\n" %
+                                    ("*Bouncer*", self.nick, self.nick, self.username, self.host))
+                    else:  # Client did not send USER command when expected
+                        self.quit("Access Denied")
+                        print "*** [BouncerConnection] Incoming connection from %s failed: Expected USER." % (self.host)
+                        break
+
+                elif cmd.upper() == "QUIT":
+                    self.quit(extinfo)
+                    break
+
+                elif cmd.upper() == "SHOW":
+                    if target:
+                        for chan in target.split(","):
+                            chantypes = self.context.supports.get(
+                                "CHANTYPES", "&#+!")
+                            if re.match(irc._chanmatch % re.escape(chantypes), target):
+                                translationfound = False
+                                for channel, channame in conf.translations.items():
+                                    if translation.lower() == chan.lower():
+                                        translationfound = True
+                                if not translationfound:
+                                    channel = self.context[chan]
+                                    channame = channel.name
+
+                                if channel in self.hidden:
+                                    with self.lock:
+                                        self.hidden.remove(channel)
+
+                                        if channel in self.context.identity.channels:
                                             # JOIN command
-                                            self.connection.send(":%s!%s@%s JOIN :%s\n" % (
-                                                self.IRC.identity.nick, self.IRC.identity.username, self.IRC.identity.host, channel.name))
+                                            self.connection.send(
+                                                (u":%s!%s@%s JOIN :%s\n" % (self.context.identity.nick, self.context.identity.username, self.context.identity.host, channame)).encode("utf8"))
 
                                             # Topic
-                                            self.connection.send(":%s 332 %s %s :%s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, channel.name, channel.topic))
-                                            self.connection.send(":%s 333 %s %s %s %s\n" % (self.IRC.serv, self.IRC.identity.nick, channel.name, channel.topicsetby.nick if type(
-                                                channel.topicsetby) == irc.User else channel.topicsetby, channel.topictime))
+                                            self.connection.send(
+                                                (u":%s 332 %s %s :%s\n" % (self.context.serv, self.context.identity.nick, channame, channel.topic)).encode("utf8"))
+                                            self.connection.send((u":%s 333 %s %s %s %s\n" % (self.context.serv, self.context.identity.nick, channame, channel.topicsetby.nick if type(
+                                                channel.topicsetby) == irc.User else channel.topicsetby, channel.topictime)).encode("utf8"))
 
                                             # Determine if +s or +p modes are
                                             # set in channel
@@ -654,67 +852,140 @@ class BouncerConnection (Thread):
 
                                             # Construct NAMES for channel.
                                             namesusers = []
-                                            modes, symbols = self.IRC.supports[
+                                            modes, symbols = self.context.supports[
                                                 "PREFIX"]
-                                            self.connection.send(":%s 353 %s %s %s :%s\n" % (
-                                                self.IRC.serv,
-                                                self.IRC.identity.nick,
+                                            self.connection.send((u":%s 353 %s %s %s :%s\n" % (
+                                                self.context.serv,
+                                                self.context.identity.nick,
                                                 "@" if secret else (
                                                     "*" if private else "="),
-                                                channel.name,
-                                                string.join([string.join([symbols[k] if modes[k] in channel.modes.keys() and user in channel.modes[modes[k]] else "" for k in xrange(len(modes))], "") + user.nick for user in channel.users]))
-                                            )
-                                            self.connection.send(":%s 366 %s %s :End of /NAMES list.\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, channel.name))
-                                else:
-                                    self.send(
-                                        ":*Bouncer* NOTICE %s :Not connected to server. Type /bncconnect to attempt connection.\n" % self.nick)
-                                    self.send(":%s 001 %s :Welcome to the Bouncer IRC Network %s!%s@%s\n" % (
-                                        "*Bouncer*", self.nick, self.nick, self.username, self.host))
-                        else:  # User not found
-                            self.quit("Access Denied")
-                            break
-                    else:  # Client did not send USER command when expected
-                        self.quit("Access Denied")
-                        print "*** [BouncerConnection] Incoming connection from %s failed: Expected USER." % (self.host)
-                        break
+                                                channame,
+                                                u" ".join([u"".join([symbols[k] if modes[k] in channel.modes.keys() and user in channel.modes[modes[k]] else "" for k in xrange(len(modes))]) + user.nick for user in channel.users]))
+                                            ).encode("utf8"))
+                                            self.connection.send((u":%s 366 %s %s :End of /NAMES list.\n" % (
+                                                self.context.serv, self.context.identity.nick, channame)).encode("utf8"))
+                                        else:
+                                            self.connection.send((u":%s 442 %s %s :You are not on that channel.\n" % (
+                                                self.context.serv, self.context.identity.nick, channame)).encode("utf8"))
+                            else:
+                                self.connection.send((u":%s 403 %s %s :Invalid channel name.\n" % (
+                                    self.context.serv, self.context.identity.nick, chan)).encode("utf8"))
+                    else:
+                        self.connection.send((u":%s 461 %s SHOW :Not enough parameters.\n" % (
+                            self.context.serv, self.context.identity.nick)).encode("utf8"))
+                        self.connection.send((u":%s 304 %s :SYNTAX SHOW <channel>{,<channel>}\n" % (
+                            self.context.serv, self.context.identity.nick)).encode("utf8"))
+                elif cmd.upper() == "HIDE":
+                    if target:
+                        for chan in target.split(","):
+                            chantypes = self.context.supports.get(
+                                "CHANTYPES", "&#+!")
+                            if re.match(irc._chanmatch % re.escape(chantypes), target):
+                                translationfound = False
+                                for channel, channame in conf.translations.items():
+                                    if translation.lower() == chan.lower():
+                                        translationfound = True
+                                if not translationfound:
+                                    channel = self.context[chan]
+                                    channame = channel.name
 
-                elif cmd.upper() == "QUIT":
-                    self.quit(extinfo)
-                    break
+                                if channel not in self.hidden:
+                                    with self.lock:
+                                        self.hidden.append(channel)
+
+                                        if channel in self.context.identity.channels:
+                                            # PART command
+                                            self.connection.send((u":%s!%s@%s PART %s :Hiding channel\n" % (
+                                                self.context.identity.nick, self.context.identity.username, self.context.identity.host, channame)).encode("utf8"))
+                                        else:
+                                            self.connection.send((u":%s 442 %s %s :You are not on that channel.\n" % (
+                                                self.context.serv, self.context.identity.nick, channame)).encode("utf8"))
+                            else:
+                                self.connection.send((u":%s 403 %s %s :Invalid channel name.\n" % (
+                                    self.context.serv, self.context.identity.nick, chan)).encode("utf8"))
+                    else:
+                        self.connection.send((u":%s 461 %s HIDE :Not enough parameters.\n" % (
+                            self.context.serv, self.context.identity.nick)).encode("utf8"))
+                        self.connection.send((u":%s 304 %s :SYNTAX HIDE <channel>{,<channel>}\n" % (
+                            self.context.serv, self.context.identity.nick)).encode("utf8"))
 
                 elif cmd.upper() == "PING":
                     self.send(":%s PONG %s :%s\n" %
-                              (self.IRC.serv, self.IRC.serv, self.IRC.identity.nick if type(self.IRC.identity) == irc.User else "***"))
+                              (self.context.serv, self.context.serv, self.context.identity.nick if type(self.context.identity) == irc.User else "***"))
 
                 elif cmd.upper() == "BNCCONNECT":
-                    with self.IRC.lock:
-                        if self.IRC.isAlive() and self.IRC.connected:
+                    with self.context.lock:
+                        if self.context.isAlive() and self.context.connected:
                             self.send(
                                 ":*Bouncer* NOTICE %s :Bouncer is already connected.\n" % self.nick)
-                        else:
-                            self.IRC.start()
+                    self.context.start()
 
                 elif cmd.upper() == "BNCQUIT":
-                    with self.IRC.lock:
-                        if self.IRC.isAlive() and self.IRC.connected and self.IRC.registered:
+                    with self.context.lock:
+                        if self.context.isAlive() and self.context.connected and self.context.registered:
                             quitmsg = " ".join(
                                 [word for word in [target, params, extinfo] if word])
-                            self.IRC.quit(quitmsg)
+                            self.context.quit(quitmsg)
                         else:
                             self.send(
                                 ":*Bouncer* NOTICE %s :Bouncer is already disconnected.\n" % self.nick)
 
                 else:
-                    with self.IRC.lock:
-                        if not self.IRC.connected:
+                    if target:
+                        targetlist = []
+                        for targ in target.split(","):
+                            translationfound = False
+                            for (channel, translation) in conf.translations.items():
+                                if translation.lower() == targ.lower():
+                                    # print channel
+                                    targetlist.append(channel.name)
+                                    translationfound = True
+                                    break
+                            if not translationfound:
+                                targetlist.append(targ)
+                        target = ",".join(targetlist)
+
+                        oldparams = params
+                        params = []
+                        for param in oldparams.split():
+                            translationfound = False
+                            for (channel, translation) in conf.translations.items():
+                                # print target, (channel, translation)
+                                if translation.lower() == param.lower():
+                                    # print channel
+                                    params.append(channel.name)
+                                    translationfound = True
+                                    break
+                            if not translationfound:
+                                params.append(param)
+                        params = " ".join(params)
+
+                        #print (cmd, target, params, extinfo)
+
+                        if params and extinfo:
+                            line = "%s %s %s :%s" % (
+                                cmd, target, params, extinfo)
+                        elif params:
+                            line = "%s %s %s" % (cmd, target, params)
+                        elif extinfo:
+                            line = "%s %s :%s" % (cmd, target, extinfo)
+                        else:
+                            line = "%s %s" % (cmd, target)
+
+                    with self.context.lock:
+                        # print "Locked"
+                        # print self.context.connected,
+                        # self.context.registered, cmd.upper()
+                        if not self.context.connected:
                             self.send(
                                 ":*Bouncer* NOTICE %s :Not connected to server. Type /bncconnect to attempt connection.\n" % self.nick)
                             break
-                        elif not self.IRC.registered:
+
+                        elif not self.context.registered:
                             self.send(
                                 ":*Bouncer* NOTICE %s :Not registered.\n" % self.nick)
                             break
+
                         elif cmd.upper() in ("PRIVMSG", "NOTICE"):
                             # Check if CTCP
                             ctcp = re.findall(
@@ -723,33 +994,42 @@ class BouncerConnection (Thread):
                             if ctcp:  # If CTCP, only want to
                                 (ctcptype, ext) = ctcp[0]  # Unpack CTCP info
 
-                                if ctcptype == "LAGCHECK":  # Client is doing a lag check. No need to send to IRC network, just reply back.
+                                if ctcptype == "LAGCHECK":  # Client is doing a lag check. No need to send to context network, just reply back.
                                     self.send(":%s!%s@%s %s\n" % (
-                                        self.IRC.identity.nick, self.IRC.identity.username, self.IRC.identity.host, line))
+                                        self.context.identity.nick, self.context.identity.username, self.context.identity.host, line))
                                 else:
-                                    self.IRC.raw(line, origin=self)
+                                    self.context.raw(line, origin=self)
                             else:
-                                self.IRC.raw(line, origin=self)
+                                self.context.raw(line, origin=self)
 
                         elif cmd.upper() == "MODE":  # Will want to determine is requesting modes, or attempting to modify modes.
-                            if target and "CHANTYPES" in self.IRC.supports.keys() and target[0] in self.IRC.supports["CHANTYPES"]:
+                            # if target and "CHANTYPES" in
+                            # self.context.supports.keys() and target[0] in
+                            # self.context.supports["CHANTYPES"]:
+                            chantypes = self.context.supports.get(
+                                "CHANTYPES", "&#+!")
+                            if re.match(irc._chanmatch % re.escape(chantypes), target):
+                                channel = self.context[target]
+                                if channel in conf.translations.keys():
+                                    channame = conf.translations[channel]
+                                else:
+                                    channame = channel.name
+
                                 if params == "":
-                                    channel = self.IRC.channel(target)
                                     modes = channel.modes.keys()
-                                    modestr = "".join([mode for mode in modes if mode not in self.IRC.supports[
-                                                      "CHANMODES"][0] + self.IRC.supports["PREFIX"][0] and channel.modes[mode]])
-                                    params = " ".join([channel.modes[mode] for mode in modes if mode in self.IRC.supports[
-                                                      "CHANMODES"][1] + self.IRC.supports["CHANMODES"][2] and channel.modes[mode]])
+                                    modestr = "".join([mode for mode in modes if mode not in self.context.supports[
+                                                      "CHANMODES"][0] + self.context.supports["PREFIX"][0] and channel.modes[mode]])
+                                    params = " ".join([channel.modes[mode] for mode in modes if mode in self.context.supports[
+                                                      "CHANMODES"][1] + self.context.supports["CHANMODES"][2] and channel.modes[mode]])
                                     with self.lock:
                                         if len(modestr):
-                                            self.connection.send(":%s 324 %s %s +%s %s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, channel.name, modestr, params))
+                                            self.connection.send(
+                                                (u":%s 324 %s %s +%s %s\n" % (self.context.serv, self.context.identity.nick, channame, modestr, params)).encode("utf8"))
                                         if channel.created:
-                                            self.connection.send(":%s 329 %s %s %s\n" % (
-                                                self.IRC.serv, self.IRC.identity.nick, channel.name, channel.created))
-                                elif re.match("^\\+?[%s]+$" % self.IRC.supports["CHANMODES"][0], params) and extinfo == "":
+                                            self.connection.send(
+                                                (u":%s 329 %s %s %s\n" % (self.context.serv, self.context.identity.nick, channame, channel.created)).encode("utf8"))
+                                elif re.match("^\\+?[%s]+$" % self.context.supports["CHANMODES"][0], params) and extinfo == "":
                                     # print "ddd Mode List Request", params
-                                    channel = self.IRC.channel(target)
                                     redundant = []
                                     for mode in params.lstrip("+"):
                                         if mode in redundant or mode not in listnumerics.keys():
@@ -758,34 +1038,36 @@ class BouncerConnection (Thread):
                                         with self.lock:
                                             if mode in channel.modes.keys():
                                                 for (mask, setby, settime) in channel.modes[mode]:
-                                                    self.connection.send(":%s %d %s %s %s %s %s\n" % (
-                                                        self.IRC.serv, i, channel.context.identity.nick, channel.name, mask, setby, settime))
-                                            self.connection.send(":%s %d %s %s :End of %s\n" % (
-                                                self.IRC.serv, e, channel.context.identity.nick, channel.name, l))
+                                                    self.connection.send(
+                                                        (u":%s %d %s %s %s %s %s\n" % (self.context.serv, i, channel.context.identity.nick, channame, mask, setby, settime)).encode("utf8"))
+                                            self.connection.send(
+                                                (u":%s %d %s %s :End of %s\n" % (self.context.serv, e, channel.context.identity.nick, channame, l)).encode("utf8"))
                                         redundant.append(mode)
                                 else:
-                                    self.IRC.raw(line, origin=self)
-                            elif params == "" and target.lower() == self.IRC.identity.nick.lower():
+                                    self.context.raw(line, origin=self)
+                            elif params == "" and target.lower() == self.context.identity.nick.lower():
                                 with self.lock:
-                                    self.connection.send(":%s 221 %s +%s\n" % (
-                                        self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.modes))
-                                    if "s" in self.IRC.identity.modes and self.IRC.identity.snomask:
-                                        self.connection.send(":%s 008 %s +%s :Server notice mask\n" % (
-                                            self.IRC.serv, self.IRC.identity.nick, self.IRC.identity.snomask))
+                                    self.connection.send(
+                                        (u":%s 221 %s +%s\n" % (self.context.serv, self.context.identity.nick, self.context.identity.modes)).encode("utf8"))
+                                    if "s" in self.context.identity.modes and self.context.identity.snomask:
+                                        self.connection.send((u":%s 008 %s +%s :Server notice mask\n" % (
+                                            self.context.serv, self.context.identity.nick, self.context.identity.snomask)).encode("utf8"))
                             else:
-                                self.IRC.raw(line, origin=self)
+                                self.context.raw(line, origin=self)
                         else:
-                            self.IRC.raw(line, origin=self)
+                            self.context.raw(line, origin=self)
 
         except SystemExit:
             pass  # No need to pass error message if break resulted from sys.exit()
         except:
             exc, excmsg, tb = sys.exc_info()
             self.quitmsg = str(excmsg)
-            if self.IRC:
+            if self.context:
                 exc, excmsg, tb = sys.exc_info()
-                self.IRC.logwrite(*["!!! [BouncerConnection] Exception in thread %(self)s" % vars()] + [
-                                  "!!! [BouncerConnection] %(tbline)s" % vars() for tbline in traceback.format_exc().split("\n")])
+                self.context.logwrite(*["!!! [BouncerConnection] Exception in thread %(self)s" % vars()] + [
+                                      "!!! [BouncerConnection] %(tbline)s" % vars() for tbline in traceback.format_exc().split("\n")])
+                print >>sys.stderr, "Exception in thread %(self)s" % vars()
+                print >>sys.stderr, traceback.format_exc()
         finally:
             # Juuuuuuust in case.
             with self.lock:
@@ -795,29 +1077,29 @@ class BouncerConnection (Thread):
                 except:
                     pass
 
-            if self.IRC:
-                self.IRC.logwrite(
+            if self.context:
+                self.context.logwrite(
                     "*** [BouncerConnection] Connection from %s terminated (%s)." % (self.host, self.quitmsg))
 
             if self in self.bouncer.connections:
                 with self.bouncer.lock:
                     self.bouncer.connections.remove(self)
-                    if self.IRC.connected and self.IRC.identity and len([bncconnection for bncconnection in self.bouncer.connections if bncconnection.IRC == self.IRC]) == 0 and self.IRC.registered and type(self.IRC.identity) == irc.User and not self.IRC.identity.away and self.bouncer.autoaway:
+                    if self.context.connected and self.context.identity and len([bncconnection for bncconnection in self.bouncer.connections if bncconnection.context == self.context]) == 0 and self.context.registered and type(self.context.identity) == irc.User and not self.context.identity.away and self.bouncer.autoaway:
                         # Bouncer automatically sets away status.
-                        self.IRC.raw("AWAY :%s" % self.bouncer.autoaway)
+                        self.context.raw("AWAY :%s" % self.bouncer.autoaway)
                     if self.debug:
-                        self.IRC.logwrite(
+                        self.context.logwrite(
                             "dbg [BouncerConnection] Attempting to broadcast terminated connection %(self)s." % vars())
                     for bouncerconnection in self.bouncer.connections:
-                        if bouncerconnection.IRC == self.IRC:
+                        if bouncerconnection.context == self.context:
                             if self.debug:
-                                self.IRC.logwrite(
+                                self.context.logwrite(
                                     "dbg [BouncerConnection] Broadcasting to %(bouncerconnection)s." % vars())
                             if not bouncerconnection.quitting:
                                 bouncerconnection.connection.send(":*Bouncer* NOTICE %s :Connection from %s to %s terminated (%s)\n" % (
-                                    bouncerconnection.IRC.identity.nick, self.host, self.IRC, self.quitmsg))
+                                    bouncerconnection.context.identity.nick, self.host, self.context, self.quitmsg))
                                 if self.debug:
-                                    self.IRC.logwrite(
+                                    self.context.logwrite(
                                         "dbg [BouncerConnection] Success: %(bouncerconnection)s." % vars())
 
 # Announce QUIT to other bouncer connections.
