@@ -13,6 +13,7 @@ import Queue
 import ssl
 import urllib2
 import irc
+import codecs
 
 modemapping = dict(Y="ircop", q="owner",
                    a="admin", o="op", h="halfop", v="voice")
@@ -135,13 +136,13 @@ class Logger(Thread):
         timestamp = reduce(lambda x, y: x + ":" + y, [
                            str(t).rjust(2, "0") for t in now[0:6]])
         if type(window) == irc.Connection:
-            log = self.logs[window] = open(
-                os.path.join(self.logroot, self.labels[window], "console-%04d.%02d.%02d.log" % now[:3]), "a")
+            log = self.logs[window] = codecs.open(
+                os.path.join(self.logroot, self.labels[window], "console-%04d.%02d.%02d.log" % now[:3]), "a", encoding="utf8")
             print >>log, "%s ### Log file opened" % (irc.timestamp())
         elif type(window) == irc.Channel:
             label = self.labels[window.context]
-            log = self.logs[window] = open(os.path.join(self.logroot, label, "channel-%s-%04d.%02d.%02d.log" % (
-                (urllib2.quote(window.name.lower()).replace("/", "%2f"),) + now[:3])), "a")
+            log = self.logs[window] = codecs.open(os.path.join(self.logroot, label, "channel-%s-%04d.%02d.%02d.log" % (
+                (urllib2.quote(window.name.lower()).replace("/", "%2f"),) + now[:3])), "a", encoding="utf8")
             print >>log, "%s ### Log file opened" % (irc.timestamp())
             self.logs[window].flush()
             if window.context.identity in window.users:
@@ -185,7 +186,8 @@ class Logger(Thread):
                     del self.logs[other]
                     self.logs[window] = log
             if window not in self.logs.keys():
-                log = self.logs[window] = open(logname, "a")
+                log = self.logs[window] = codecs.open(
+                    logname, "a", encoding="utf8")
             else:
                 log = self.logs[window]
             print >>log, "%s ### Log file opened" % (irc.timestamp())
@@ -579,8 +581,12 @@ class Logger(Thread):
     def onTopicSet(self, IRC, user, channel, topic):
         # Called when channel topic is changed.
         ts = irc.timestamp()
-        print >>self.logs[channel], "%s <<< :%s!%s@%s TOPIC %s :%s" % (
-            ts, user.nick, user.username, user.host, channel.name, topic)
+        if type(user) == irc.User:
+            print >>self.logs[channel], "%s <<< :%s!%s@%s TOPIC %s :%s" % (
+                ts, user.nick, user.username, user.host, channel.name, topic)
+        else:
+            print >>self.logs[channel], "%s <<< :%s TOPIC %s :%s" % (
+                ts, user, channel.name, topic)
         self.logs[channel].flush()
 
     def onChanModeSet(self, IRC, user, channel, modedelta):
@@ -650,7 +656,7 @@ class Logger(Thread):
             ts, IRC.serv, IRC.identity.nick, channel.name, created)
         log.flush()
 
-    def onUnhandled(self, IRC, line, origin, cmd, target, params, extinfo):
+    def onUnhandled(self, IRC, line, origin, cmd, target, params, extinfo, targetprefix):
         ts = irc.timestamp()
         print >>self.logs[IRC], "%s <<< %s" % (ts, line)
         self.logs[IRC].flush()
