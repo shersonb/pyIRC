@@ -26,17 +26,23 @@ class Autoexec(object):
         if context in self.networks.keys():
             raise BaseException, "Network already exists"
         self.networks[context] = irc.Config(
-            label=label, onconnect=onconnect, onregister=onregister, autojoin=irc.ChanList(
+            self, label=label, onconnect=onconnect, onregister=onregister, autojoin=irc.ChanList(
                 autojoin, context=context),
             usermodes=usermodes, nsautojoin=irc.ChanList(nsautojoin, context=context), nsmatch=nsmatch, wallet=wallet,
             opername=opername, opermodes=opermodes, snomasks=snomasks, operexec=operexec, operjoin=irc.ChanList(operjoin, context=context), autorejoin=autorejoin)
         self._rejoinchannels[context] = None
+        return self.networks[context]
 
     def onDisconnect(self, context, expected):
         conf = self.networks[context]
         if conf.autorejoin and not expected and context.identity:
             self._rejoinchannels[context] = irc.ChanList(
                 context.identity.channels, context=context)  # Store a *copy* of the list of channels
+
+    def onQuit(self, context, user, quitmsg):
+        if user == context.identity and not context._quitexpected:
+            # Bot received a QUIT message for itself, and was not expected.
+            self.onDisconnect(context, False)
 
     def onAddonRem(self, context):
         del self.networks[context], self._rejoinchannels[context]

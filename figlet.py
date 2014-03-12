@@ -4,6 +4,7 @@ import os
 
 
 class Figlet(object):
+
     def onChanMsg(self, IRC, user, channel, targetprefix, msg):
         matches = re.findall("^!figlet\\s+(.*)$", msg)
         if matches:

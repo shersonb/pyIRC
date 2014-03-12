@@ -1,5 +1,6 @@
 #!/usr/bin/python
-from threading import Thread, Condition, Lock, currentThread
+from threading import Thread, Condition, currentThread
+from threading import RLock as Lock
 import re
 import time
 import sys
@@ -10,10 +11,29 @@ import platform
 import traceback
 import ssl
 import glob
-from collections import deque
-import iqueue as Queue
+from collections import deque, OrderedDict
 import chardet
 import codecs
+import new
+import inspect
+import warnings
+import random
+
+
+def autodecode(s):
+    try:
+        return s.decode("utf8")
+    except UnicodeDecodeError:
+        # Attempt to figure encoding
+        detected = chardet.detect(s)
+        try:
+            return s.decode(detected['encoding'])
+        except UnicodeDecodeError:
+            return s.decode("utf8", "replace")
+
+
+class AddonWarning(Warning):
+    pass
 
 
 class InvalidName(BaseException):
@@ -134,6 +154,9 @@ _realnamematch = r"^[^\n]*$"
 _ircmatch = r"^(?::(.+?)(?:!(.+?)@(.+?))?\s+)?([A-Za-z0-9]+?)\s*(?:\s+(.+?)(?:\s+(.+?))??)??(?:\s+:(.*))?$"
 _ctcpmatch = "^\x01(.*?)(?:\\s+(.*?)\\s*)?\x01$"
 _prefixmatch = r"\((.*)\)(.*)"
+_defaultchanmodes = u"b,k,l,imnpst".split(",")
+_defaultprefix = ("ov", "@+")
+_defaultchantypes = "&#+!"
 
 _privmodeeventnames = dict(q=("Owner", "Deowner"), a=("Admin", "Deadmin"), o=(
     "Op", "Deop"), h=("Halfop", "Dehalfop"), v=("Voice", "Devoice"))
@@ -154,28 +177,21 @@ def timestamp():
 
 
 class Connection(object):
+    __name__ = "pyIRC"
+    __version__ = "2.0"
+    __author__ = "Brian Sherson"
+    __date__ = "February 21, 2014"
 
-    def __init__(self, server, nick="ircbot", username="python", realname="Python IRC Library", passwd=None, port=None, ipv6=False, ssl=False, autoreconnect=True, log=sys.stderr, timeout=300, retrysleep=5, maxretries=15, onlogin=None, quietpingpong=True, pinginterval=60):
-        self.__name__ = "pyIRC"
-        self.__version__ = "1.3"
-        self.__author__ = "Brian Sherson"
-        self.__date__ = "February 8, 2014"
-
-        if port == None:
-            self.port = 6667 if not ssl else 6697
-        else:
+    def __init__(self, server, nick="ircbot", username="python", realname="Python IRC Library", passwd=None, port=None, ipvers=(socket.AF_INET6, socket.AF_INET), secure=False, autoreconnect=True, timeout=300, retrysleep=5, maxretries=15, protoctl=("UHNAMES", "NAMESX"), quietpingpong=True, pinginterval=60, addons=None, autostart=False):
+        if port is None or (type(port) == int and 0 < port < 65536):
             self.port = port
+        else:
+            raise ValueError, "Invalid value for 'port'"
 
-        if type(nick) in (str, unicode):
-            if re.match(_nickmatch, nick):
-                self.nick = [nick]
-            else:
-                raise InvalidCharacter
-        elif type(nick) in (list, tuple):
-            if all([re.match(_nickmatch, n) for n in nick]):
-                self.nick = nick
-            else:
-                raise InvalidCharacter
+        if re.match(_nickmatch, nick) if (type(nick) in (str, unicode)) else all([re.match(_nickmatch, n) for n in nick]) if (type(nick) in (list, tuple)) else False:
+            self.nick = nick
+        else:
+            raise ValueError, "Invalid value for 'nick'"
 
         if re.match(_realnamematch, realname):
             self.realname = realname
@@ -193,27 +209,51 @@ class Connection(object):
             raise InvalidCharacter
 
         self.server = server
-        self.ssl = ssl
-        self.ipv6 = ipv6
+        self.secure = secure
+        self.ipvers = ipvers if type(ipvers) == tuple else (ipvers,)
 
-        self.autoreconnect = autoreconnect
-        self.maxretries = maxretries
-        self.timeout = timeout
-        self.retrysleep = retrysleep
-        self.quietpingpong = quietpingpong
-        self.pinginterval = pinginterval
+        self.protoctl = protoctl
+
+        if type(autoreconnect) == bool:
+            self.autoreconnect = autoreconnect
+        else:
+            raise ValueError, "Invalid value for 'autoreconnect'"
+
+        if type(maxretries) in (int, long):
+            self.maxretries = maxretries
+        else:
+            raise ValueError, "Invalid value for 'maxretries'"
+
+        if type(timeout) in (int, long):
+            self.timeout = timeout
+        else:
+            raise ValueError, "Invalid value for 'timeout'"
+
+        if type(retrysleep) in (int, long):
+            self.retrysleep = retrysleep
+        else:
+            raise ValueError, "Invalid value for 'retrysleep'"
+
+        if type(quietpingpong) == bool:
+            self.quietpingpong = quietpingpong
+        else:
+            raise ValueError, "Invalid value for 'quietpingpong'"
+
+        if type(pinginterval) in (int, long):
+            self.pinginterval = pinginterval
+        else:
+            raise ValueError, "Invalid value for 'pinginterval'"
 
         self._quitexpected = False
-        self.log = log
-
-        self.addons = []
-        self.trusted = []  # To be implemented later
+        self.log = sys.stdout
 
         self.lock = Lock()
 
         self._loglock = Lock()
         self._outlock = Lock()
         self._sendline = Condition(self._outlock)
+        self._connecting = Condition(self.lock)
+        self._disconnecting = Condition(self.lock)
         self._outgoing = deque()
 
         self._sendhandlerthread = None
@@ -222,9 +262,22 @@ class Connection(object):
         # Initialize IRC environment variables
         self.users = UserList(context=self)
         self.channels = ChanList(context=self)
+        self.addons = []
+
+        self.trusted = []  # To be implemented later
         self._init()
+        if type(addons) == list:
+            for addon in addons:
+                if type(addon) == dict:
+                    self.addAddon(**addon)
+                else:
+                    self.addAddon(addon)
+        if autostart:
+            self.connect()
 
     def _init(self):
+        self.ipver = None
+        self.addr = None
         self._connected = False
         self._registered = False
         self._connection = None
@@ -258,14 +311,18 @@ class Connection(object):
         with self._loglock:
             ts = timestamp()
             for line in lines:
-                print >>self.log, "%s %s" % (ts, line)
+                try:
+                    print >>self.log, u"%s %s" % (ts, line)
+                except:
+                    print line
+                    raise
             self.log.flush()
 
     def logopen(self, filename, encoding="utf8"):
         with self._loglock:
             ts = timestamp()
             newlog = codecs.open(filename, "a", encoding=encoding)
-            if type(self.log) == file and not self.log.closed:
+            if isinstance(self.log, codecs.StreamReaderWriter) and not self.log.closed:
                 if self.log not in (sys.stdout, sys.stderr):
                     print >>self.log, "%s ### Log file closed" % (ts)
                     self.log.close()
@@ -273,154 +330,332 @@ class Connection(object):
             print >>self.log, "%s ### Log file opened" % (ts)
             self.log.flush()
 
-    def _event(self, method, modlist, exceptions=False, data=None, **params):
-        # Used to call event handlers on all attached addons, when applicable.
+    # Used to call event handlers on all attached addons, when applicable.
+    def _event(self, addons, events, line=None, data=None, exceptions=False):
         handled = []
         unhandled = []
         errors = []
-        for k, addon in enumerate(modlist):
-            if modlist.index(addon) < k:
+        for k, addon in enumerate(addons):
+            if addons.index(addon) < k:
                 # Duplicate
                 continue
-            if method in dir(addon) and callable(getattr(addon, method)):
-                f = getattr(addon, method)
-                args = params
-            elif "onOther" in dir(addon) and callable(addon.onOther) and data:
-                f = addon.onOther
-                args = data
-            elif "onUnhandled" in dir(addon) and callable(addon.onUnhandled) and data:
-                # Backwards compatability for addons that still use
-                # onUnhandled. Use onOther in future development.
-                f = addon.onUnhandled
-                args = data
-            else:
-                unhandled.append(addon)
-                continue
-            try:
-                f(self, **args)
-            except:
-                exc, excmsg, tb = sys.exc_info()
-                errors.append((addon, exc, excmsg, tb))
 
-                # Print to log AND stderr
-                self.logwrite(*["!!! Exception in addon %(addon)s" % vars()] + [
-                              "!!! %s" % line for line in traceback.format_exc().split("\n")])
-                print >>sys.stderr, "Exception in addon %(addon)s" % vars()
-                print >>sys.stderr, traceback.format_exc()
-                if exceptions:  # If set to true, we raise the exception.
-                    raise
-            else:
-                handled.append(addon)
+            if type(addon) == Config:
+                addon = addon.addon
+
+            fellback = False  # Switch this to True when a fallback is used so that we only call onOther once.
+
+            # Iterate through all events.
+            for (method, args, fallback) in events:
+                if method in dir(addon) and callable(getattr(addon, method)):
+                    f = getattr(addon, method)
+                elif fallback and not fellback:
+                    if "onOther" in dir(addon) and callable(addon.onOther) and data:
+                        f = addon.onOther
+                        args = dict(line=line, **data)
+                        fellback = True
+                    elif "onUnhandled" in dir(addon) and callable(addon.onUnhandled) and data:
+                        # Backwards compatability for addons that still use
+                        # onUnhandled. Use onOther in future development.
+                        f = addon.onUnhandled
+                        args = dict(line=line, **data)
+                        fellback = True
+                    else:
+                        unhandled.append(addon)
+                        continue
+                else:
+                    unhandled.append(addon)
+                    continue
+
+                if type(f) == new.instancemethod:
+                    argspec = inspect.getargspec(f.im_func)
+                else:
+                    argspec = inspect.getargspec(f)
+                if argspec.keywords == None:
+                    args = {
+                        arg: val for arg, val in args.items() if arg in argspec.args}
+                try:
+                    f(self, **args)
+                except:
+                    # print f, args
+                    exc, excmsg, tb = sys.exc_info()
+                    errors.append((addon, exc, excmsg, tb))
+
+                    # Print to log AND stderr
+                    tblines = [u"!!! Exception in addon %(addon)s" % vars()]
+                    tblines.append(u"!!! Function: %s" % f)
+                    tblines.append(u"!!! Arguments: %s" % args)
+                    for line in traceback.format_exc().split("\n"):
+                        tblines.append(u"!!! %s" % autodecode(line))
+                    self.logwrite(*tblines)
+                    print >>sys.stderr, "Exception in addon %(addon)s" % vars()
+                    print >>sys.stderr, u"Function: %s" % f
+                    print >>sys.stderr, u"Arguments: %s" % args
+                    print >>sys.stderr, traceback.format_exc()
+                    if exceptions:  # If set to true, we raise the exception.
+                        raise
+                else:
+                    handled.append(addon)
         return (handled, unhandled, errors)
 
-    # TODO: Build method validation into the next two addons, Complain when a
-    # method is not callable or does not take in the expected arguments.
+    # TODO: Build method validation into the next two addons, Complain when a method is not callable or does not take in the expected arguments.
+    # Inspects the methods of addon to make sure
+    def validateAddon(self, addon):
+        supported = self.eventsupports()
+        keys = supported.keys()
+        for fname in dir(addon):
+            if fname in keys:
+                supportedargs = supported[fname]
+            elif re.match(r"^on(?:Send)?[A-Z]+$", fname):
+                supportedargs = (
+                    "line", "origin", "target", "targetprefix", "params", "extinfo")
+            elif re.match(r"^on\d{3}$", fname):
+                supportedargs = (
+                    "line", "origin", "target", "params", "extinfo")
+            else:
+                continue
+            func = getattr(addon, fname)
+            argspec = inspect.getargspec(func)
+            if type(func) == new.instancemethod:
+                funcargs = argspec.args[1:]
+            if argspec.defaults:
+                requiredargs = funcargs[:-len(argspec.defaults)]
+            else:
+                requiredargs = funcargs
+            contextarg = funcargs[0]
+            unsupported = [
+                arg for arg in requiredargs[1:] if arg not in supportedargs]
+            if len(unsupported):
+                warnings.warn(
+                    "Function '%s' requires unsupported arguments: %s" %
+                    (func.__name__, ", ".join(unsupported)), AddonWarning)
+                self.logwrite(
+                    "!!! AddonWarning: Function '%s' requires unsupported arguments: %s" %
+                    (func.__name__, ", ".join(unsupported)))
+            if argspec.keywords == None:
+                unsupported = [
+                    arg for arg in supportedargs if arg not in funcargs[1:]]
+                if len(unsupported):
+                    warnings.warn(
+                        "Function '%s' does not accept supported arguments: %s" %
+                        (func.__name__, ", ".join(unsupported)), AddonWarning)
+                    self.logwrite(
+                        "!!! AddonWarning: Function '%s' does not accept supported arguments: %s" %
+                        (func.__name__, ", ".join(unsupported)))
 
     def addAddon(self, addon, trusted=False, **params):
-        if addon in self.addons:
-            raise BaseException, "Addon already added."
+        self.validateAddon(addon)
+        for a in self.addons:
+            if (type(a) == Config and a.addon is addon) or a is addon:
+                raise BaseException, "Addon already added."
         with self.lock:
-            self._event("onAddonAdd", [addon], exceptions=True, **params)
-            self.addons.append(addon)
+            if params:
+                defconf = Config(addon, **params)
+            else:
+                defconf = addon
+            if hasattr(addon, "onAddonAdd") and callable(addon.onAddonAdd):
+                conf = addon.onAddonAdd(self, **params)
+                if conf is not None:
+                    self.addons.append(conf)
+                else:
+                    self.addons.append(defconf)
+            else:
+                self.addons.append(defconf)
             self.logwrite("*** Addon %s added." % repr(addon))
             if trusted:
                 self.trusted.append(addon)
 
     def insertAddon(self, index, addon, trusted=False, **params):
-        if addon in self.addons:
-            raise BaseException, "Addon already added."
+        self.validateAddon(addon)
+        for a in self.addons:
+            if (type(a) == Config and a.addon is addon) or a is addon:
+                raise BaseException, "Addon already added."
         with self.lock:
-            self._event("onAddonAdd", [addon], exceptions=True, **params)
-            self.addons.insert(index, addon)
+            if params:
+                defconf = Config(addon, **params)
+            else:
+                defconf = addon
+            if hasattr(addon, "onAddonAdd") and callable(addon.onAddonAdd):
+                conf = addon.onAddonAdd(self, **params)
+                if conf is not None:
+                    self.addons.insert(index, conf)
+                else:
+                    self.addons.insert(index, defconf)
+            else:
+                self.addons.insert(index, defconf)
             self.logwrite("*** Addon %s inserted into index %d." %
                           (repr(addon), index))
             if trusted:
                 self.trusted.append(addon)
 
-    def rmAddon(self, addon, **params):
+    def rmAddon(self, addon):
         with self.lock:
             self.addons.remove(addon)
             self.logwrite("*** Addon %s removed." % repr(addon))
-            self._event("onAddonRem", [addon], exceptions=True, **params)
             if addon in self.trusted:
                 self.trusted.remove(addon)
+            if hasattr(addon, "onAddonRem") and callable(addon.onAddonAdd):
+                addon.onAddonRem(self)
 
-    def connect(self, server=None, port=None, ssl=None, ipv6=None):
-        if self.isAlive():
-            raise AlreadyConnected
-        with self._sendline:
-            self._outgoing.clear()
-        with self.lock:
-            self._recvhandlerthread = Thread(
-                target=self._recvhandler, name="Receive Handler", kwargs=dict(server=None, port=None, ssl=None, ipv6=None))
+    def connect(self, server=None, port=None, secure=None, ipvers=None, forcereconnect=False, blocking=False):
+        if ipvers != None:
+            ipvers = ipvers if type(ipvers) == tuple else (ipvers,)
+        else:
+            ipvers = self.ipvers
+
+        server = server if server else self.server
+        port = port if port else self.port
+        secure = secure if secure != None else self.secure
+
+        with self._connecting:
+            if self.isAlive():
+                if forcereconnect:
+                    self.quit("Changing server...", blocking=True)
+                else:
+                    raise AlreadyConnected
+            with self._sendline:
+                self._outgoing.clear()
+            self._recvhandlerthread = Thread(target=self._recvhandler, name="Receive Handler", kwargs=dict(
+                server=server, port=port, secure=secure, ipvers=ipvers))
             self._sendhandlerthread = Thread(
                 target=self._sendhandler, name="Send Handler")
             self._recvhandlerthread.start()
             self._sendhandlerthread.start()
+            if blocking:
+                self._connecting.wait()
+                if not self.connected:
+                    raise NotConnected
 
-    def _connect(self):
+    def _connect(self, addr, ipver, secure, hostname=None):
         with self.lock:
             if self._connected:
                 raise AlreadyConnected
-        server = self.server
-        if self.ipv6 and ":" in server:
-            server = "[%s]" % server
-        port = self.port
 
-        with self.lock:
+            if hostname:
+                if ipver == socket.AF_INET6:
+                    addrstr = "{hostname} ([{addr[0]}]:{addr[1]})".format(
+                        **vars())
+                else:
+                    addrstr = "{hostname} ({addr[0]}:{addr[1]})".format(
+                        **vars())
+            else:
+                if ipver == socket.AF_INET6:
+                    addrstr = "[{addr[0]}]:{addr[1]}".format(**vars())
+                else:
+                    addrstr = "{addr[0]}:{addr[1]}".format(**vars())
             self.logwrite(
-                "*** Attempting connection to %(server)s:%(port)s." % vars())
-            self._event("onConnectAttempt", self.addons + reduce(
-                lambda x, y: x + y, [chan.addons for chan in self.channels], []))
+                "*** Attempting connection to {addrstr}.".format(**vars()))
+            self._event(self.getalladdons(), [
+                        ("onConnectAttempt", dict(), False)])
+
         try:
-            if self.ssl:
-                connection = socket.socket(
-                    socket.AF_INET6 if self.ipv6 else socket.AF_INET, socket.SOCK_STREAM)
+            connection = socket.socket(ipver, socket.SOCK_STREAM)
+            if secure:
                 connection.settimeout(self.timeout)
                 self._connection = ssl.wrap_socket(
                     connection, cert_reqs=ssl.CERT_NONE)
             else:
-                self._connection = socket.socket(
-                    socket.AF_INET6 if self.ipv6 else socket.AF_INET, socket.SOCK_STREAM)
+                self._connection = connection
                 self._connection.settimeout(self.timeout)
-            self._connection.connect(
-                (self.server, self.port, 0, 0) if self.ipv6 else (self.server, self.port))
+            self._connection.connect(addr)
         except socket.error:
             exc, excmsg, tb = sys.exc_info()
+            self.logwrite(
+                "*** Connection to {addrstr} failed: {excmsg}.".format(**vars()))
             with self.lock:
-                self.logwrite(
-                    "*** Connection to %(server)s:%(port)s failed: %(excmsg)s." % vars())
-                self._event("onConnectFail", self.addons + reduce(
-                    lambda x, y: x + y, [chan.addons for chan in self.channels], []), exc=exc, excmsg=excmsg, tb=tb)
+                self._event(self.getalladdons(), [
+                            ("onConnectFail", dict(exc=exc, excmsg=excmsg, tb=tb), False)])
+            raise
+        else:
+            # Run onConnect on all addons to signal connection was established.
+            with self.lock:
+                self._event(
+                    self.getalladdons(), [("onConnect", dict(), False)])
+            self.logwrite(
+                "*** Connection to {addrstr} established.".format(**vars()))
+            self.addr = addr
+            self._connected = True
+            with self._connecting:
+                self._connecting.notifyAll()
+
+    def _tryaddrs(self, server, addrs, ipver, secure):
+        for addr in addrs:
+            try:
+                if server == addr[0]:
+                    self._connect(addr=addr, secure=secure, ipver=ipver)
+                else:
+                    self._connect(
+                        hostname=server, addr=addr, secure=secure, ipver=ipver)
+            except socket.error, msg:
+                if self._quitexpected:
+                    sys.exit()
+                if msg.errno == 101:  # Network is unreachable, will pass the exception on.
+                    raise
+                if self.retrysleep > 0:
+                    time.sleep(self.retrysleep)
+                if self._quitexpected:
+                    sys.exit()
+            else:
+                return True
+        return False
+
+    def _tryipver(self, server, port, ipver, secure):
+        if ipver == socket.AF_INET6:
+            self.logwrite(
+                "*** Attempting to resolve {server} to an IPv6 address...".format(**vars()))
+        else:
+            self.logwrite(
+                "*** Attempting to resolve {server}...".format(**vars()))
+
+        try:
+            addrs = socket.getaddrinfo(
+                server, port if port is not None else 6697 if self.secure else 6667, ipver)
+        except socket.gaierror, msg:
+            self.logwrite("*** Resolution failed: {msg}.".format(**vars()))
             raise
 
-        with self.lock:
-            # Run onConnect on all addons to signal connection was established.
-            self._event("onConnect", self.addons + reduce(
-                lambda x, y: x + y, [chan.addons for chan in self.channels], []))
+        # Weed out duplicates
+        addrs = list(
+            set([sockaddr for family, socktype, proto, canonname, sockaddr in addrs if family == ipver]))
+
+        n = len(addrs)
+        if n == 1:
+            addr = addrs[0]
             self.logwrite(
-                "*** Connection to %(server)s:%(port)s established." % vars())
-            self._connected = True
+                "*** Name {server} resolves to {addr[0]}.".format(**vars()))
+        else:
+            self.logwrite(
+                "*** Name {server} resolves to {n} addresses, choosing one at random until success.".format(**vars()))
+            random.shuffle(addrs)
+
+        return self._tryaddrs(server, addrs, ipver, secure)
+
+    def _tryipvers(self, server, port, ipvers, secure):
+        for ipver in ipvers:
+            try:
+                ret = self._tryipver(server, port, ipver, secure)
+            except socket.gaierror, msg:
+                if msg.errno == -2:  # Name or service not known. Again, just try next ipver.
+                    continue
+                else:
+                    raise
+            except socket.error, msg:
+                if msg.errno == 101:  # Don't err out, just try next ipver.
+                    continue
+                else:
+                    raise
+            else:
+                if ret:
+                    self.ipver = ipver
+                    return True
+        return False
 
     def _procrecvline(self, line):
-        # If received PING, then just pong back transparently, bypassing _outgoingthread.
-        #ping=re.findall("^PING :?(.*)$", line)
-        # if len(ping):
-            # if not self.quietpingpong:
-                #self.logwrite("<<< %s" % line)
-            # with self.lock:
-                #self._connection.send("PONG :%s\n" % ping[0])
-            # if not self.quietpingpong:
-                #self.logwrite(">>> %s" % "PONG :%s" % ping[0])
-            # return
-
-        # Attempts to match against pattern ":src cmd target params :extinfo"
         matches = re.findall(_ircmatch, line)
 
         # We have a match!
         if len(matches):
-            parsed = (origin, username, host, cmd,
-                      target, params, extinfo) = matches[0]
+            (origin, username, host, cmd, target, params, extinfo) = matches[0]
             unhandled = []
 
             if re.match(_intmatch, cmd):
@@ -435,12 +670,15 @@ class Connection(object):
                 self._send(u"PONG :%s" % extinfo)
 
             with self.lock:
+                data = dict(origin=origin, cmd=cmd, target=target,
+                            targetprefix=None, params=params, extinfo=extinfo)
+
                 if not self._registered:
                     if type(cmd) == int and cmd != 451 and target != "*":  # Registration complete!
                         self.identity = self.user(target, init=True)
                         self.serv = origin
-                        self._event("onRegistered", self.addons + reduce(
-                            lambda x, y: x + y, [chan.addons for chan in self.channels], []))
+                        self._event(self.getalladdons(), [
+                                    ("onRegistered", dict(), False)], line, data)
                         self._registered = True
 
                     elif cmd == 433 and target == "*":  # Server reports nick taken, so we need to try another.
@@ -452,7 +690,7 @@ class Connection(object):
                     nickname = origin
                     origin = self.user(origin)
                     if origin.nick != nickname:
-                        # Origin nickname has changed
+                        # Origin nickname case has changed
                         origin.user = nickname
                     if origin.username != username:
                         # Origin username has changed
@@ -461,988 +699,145 @@ class Connection(object):
                         # Origin host has changed
                         origin.host = host
 
+                # Check to see if target matches a channel (optionally with
+                # prefix)
+                prefix = self.supports.get("PREFIX", _defaultprefix)
+                chantypes = self.supports.get("CHANTYPES", _defaultchantypes)
                 chanmatch = re.findall(
-                    _targchanmatch % (re.escape(self.supports.get("PREFIX", ("ohv", "@%+"))[1]), re.escape(self.supports.get("CHANTYPES", "#"))), target)
+                    _targchanmatch % (re.escape(prefix[1]), re.escape(chantypes)), target)
+
                 if chanmatch:
                     targetprefix, channame = chanmatch[0]
                     target = self.channel(channame)
                     if target.name != channame:
-                        # Target channel name has changed
+                        # Target channel name has changed case
                         target.name = channame
+
+                # Check to see if target matches a valid nickname. Do NOT
+                # convert target to User instance if cmd is NICK.
                 elif re.match(_nickmatch, target) and cmd != "NICK":
                     targetprefix = ""
                     target = self.user(target)
+
+                # Otherwise, target is just left as a string
                 else:
                     targetprefix = ""
 
-                data = dict(line=line, origin=origin, cmd=cmd, target=target,
+                data = dict(origin=origin, cmd=cmd, target=target,
                             targetprefix=targetprefix, params=params, extinfo=extinfo)
 
-                # Major codeblock here! Track IRC state.
-                # Send line to addons having onRecv method first
-                if cmd not in ("PING", "PONG") or not self.quietpingpong:
-                    self._event("onRecv", self.addons, **data)
+                # Parse
 
-                # Support for further addon events is taken care of here. Each invocation of self._event will return (handled, unhandled, exceptions),
-                # where handled is the list of addons that have an event handler, and was executed without error, unhandled gives the list of addons
-                # not having the event handler, and exeptions giving the list of addons having an event handler, but an exception occurred.
-                # WARNING: When writing an addon, never, EVER attempt to aquire self.lock (IRC.lock from inside the method), or you will have a
-                # deadlock.
+                # Takes the given data and runs it through a parse method to determine what addon methods should be called later, and prepares the arguments
+                # to be passed to each of these methods.
+                # This part does not update the IRC state.
+                parsename = (
+                    "parse%03d" if type(cmd) == int else "parse%s") % cmd
 
-                if cmd == 1:
-                    self._event("onWelcome", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, msg=extinfo, data=data)
-                    self.welcome = extinfo  # Welcome message
-                elif cmd == 2:
-                    self._event("onYourHost", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, msg=extinfo, data=data)
-                    self.hostinfo = extinfo  # Your Host
-                elif cmd == 3:
-                    self._event("onServerCreated", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, msg=extinfo, data=data)
-                    self.servcreated = extinfo  # Server Created
-                elif cmd == 4:
-                    self._event("onServInfo", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, servinfo=params, data=data)
-                    self.servinfo = params  # What is this code?
-                elif cmd == 5:  # Server Supports
-                    support = dict(
-                        re.findall("([A-Za-z0-9]+)(?:=(\\S*))?", params))
-                    if support.has_key("CHANMODES"):
-                        support["CHANMODES"] = support["CHANMODES"].split(",")
-                    if support.has_key("PREFIX"):
-                        matches = re.findall(_prefixmatch, support["PREFIX"])
-                        if matches:
-                            support["PREFIX"] = matches[0]
-                        else:
-                            del support[
-                                "PREFIX"]  # Might as well delete the info if it doesn't match expected pattern
-                    self._event("onSupports", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, supports=support, data=data)
-                    self.supports.update(support)
-                    if "serv005" in dir(self) and type(self.serv005) == list:
-                        self.serv005.append(params)
-                    else:
-                        self.serv005 = [params]
-                elif cmd == 8:  # Snomask
-                    snomask = params.lstrip("+")
-                    self._event("onSnoMask", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, snomask=snomask, data=data)
-                    self.identity.snomask = snomask
-                    if "s" not in self.identity.modes:
-                        self.snomask = ""
-                elif cmd == 221:  # User Modes
-                    modes = (params if params else extinfo).lstrip("+")
-                    self._event("onUserModes", self.addons + reduce(
-                        lambda x, y: x + y, [chan.addons for chan in self.channels], []), origin=origin, snomask=modes, data=data)
-                    self.identity.modes = modes
-                    if "s" not in self.identity.modes:
-                        self.snomask = ""
-                elif cmd == 251:  # Net Stats
-                    self._event(
-                        "onNetStats", self.addons, origin=origin, netstats=extinfo, data=data)
-                    self.netstats = extinfo
-                elif cmd == 252:
-                    opcount = int(params)
-                    self._event(
-                        "onOpCount", self.addons, origin=origin, opcount=opcount, data=data)
-                    self.opcount = opcount
-                elif cmd == 254:
-                    chancount = int(params)
-                    self._event(
-                        "onChanCount", self.addons, origin=origin, chancount=chancount, data=data)
-                    self.chancount = chancount
-
-                elif cmd == 305:  # Returned from away status
-                    self._event(
-                        "onReturn", self.addons, origin=origin, msg=extinfo, data=data)
-                    self.identity.away = False
-
-                elif cmd == 306:  # Entered away status
-                    self._event(
-                        "onAway", self.addons, origin=origin, msg=extinfo, data=data)
-                    self.identity.away = True
-
-                elif cmd == 311:  # Start of WHOIS data
-                    nickname, username, host, star = params.split()
-                    user = self.user(nickname)
-                    self._event(
-                        "onWhoisStart", self.addons, origin=origin, user=user,
-                        nickname=nickname, username=username, host=host, realname=extinfo, data=data)
-                    user.nick = nickname
-                    user.username = username
-                    user.host = host
-
-                elif cmd == 301:  # Away Message
-                    user = self.user(params)
-                    self._event("onWhoisAway", self.addons, origin=origin,
-                                user=user, nickname=params, awaymsg=extinfo, data=data)
-                    user.away = True
-                    user.awaymsg = extinfo
-
-                elif cmd == 303:  # ISON Reply
-                    users = [self.user(user) for user in extinfo.split(" ")]
-                    self._event(
-                        "onIsonReply", self.addons, origin=origin, isonusers=users, data=data)
-
-                elif cmd == 307:  # Is a registered nick
-                    self._event(
-                        "onWhoisRegisteredNick", self.addons, origin=origin,
-                        user=self.user(params), nickname=params, msg=extinfo, data=data)
-                elif cmd == 378:  # Connecting From
-                    self._event(
-                        "onWhoisConnectingFrom", self.addons, origin=origin,
-                        user=self.user(params), nickname=params, msg=extinfo, data=data)
-                elif cmd == 319:  # Channels
-                    self._event("onWhoisChannels", self.addons, origin=origin, user=self.user(
-                        params), nickname=params, chanlist=extinfo.split(" "), data=data)
-                elif cmd == 310:  # Availability
-                    self._event(
-                        "onWhoisAvailability", self.addons, origin=origin,
-                        user=self.user(params), nickname=params, msg=extinfo, data=data)
-                elif cmd == 312:  # Server
-                    nickname, server = params.split(" ")
-                    user = self.user(nickname)
-                    self._event(
-                        "onWhoisServer", self.addons, origin=origin, user=user,
-                        nickname=nickname, server=server, servername=extinfo, data=data)
-                    user.server = server
-                elif cmd == 313:  # IRC Op
-                    user = self.user(params)
-                    self._event("onWhoisOp", self.addons, origin=origin,
-                                user=user, nickname=params, msg=extinfo, data=data)
-                    user.ircop = True
-                    user.ircopmsg = extinfo
-                elif cmd == 317:  # Idle and Signon times
-                    nickname, idletime, signontime = params.split(" ")
-                    user = self.user(nickname)
-                    self._event(
-                        "onWhoisTimes", self.addons, origin=origin, user=user, nickname=nickname,
-                        idletime=int(idletime), signontime=int(signontime), msg=extinfo, data=data)
-                    user.idlesince = int(time.time()) - int(idletime)
-                    user.signontime = int(signontime)
-                elif cmd == 671:  # SSL
-                    user = self.user(params)
-                    self._event("onWhoisSSL", self.addons, origin=origin,
-                                user=user, nickname=params, msg=extinfo, data=data)
-                    user.ssl = True
-                elif cmd == 379:  # User modes
-                    self._event("onWhoisModes", self.addons, origin=origin, user=self.user(
-                        params), nickname=params, msg=extinfo, data=data)
-                elif cmd == 330:  # Logged in as
-                    nickname, loggedinas = params.split(" ")
-                    user = self.user(nickname)
-                    self._event(
-                        "onWhoisLoggedInAs", self.addons, origin=origin, user=user,
-                        nickname=nickname, loggedinas=loggedinas, msg=extinfo, data=data)
-                    user.loggedinas = loggedinas
-                elif cmd == 318:  # End of WHOIS
+                # This is the case that there is a parse method specific to the
+                # given cmd.
+                if hasattr(self, parsename) and callable(getattr(self, parsename)):
+                    parsemethod = getattr(self, parsename)
                     try:
-                        user = self.user(params)
-                    except InvalidName:
-                        user = params
-                    self._event("onWhoisEnd", self.addons, origin=origin,
-                                user=user, nickname=params, msg=extinfo, data=data)
-
-                elif cmd == 321:  # Start LIST
-                    self._event(
-                        "onListStart", self.addons, origin=origin, params=params, extinfo=extinfo, data=data)
-                elif cmd == 322:  # LIST item
-                    (chan, pop) = params.split(" ", 1)
-                    self._event("onListEntry", self.addons, origin=origin, channel=self.channel(
-                        chan), population=int(pop), extinfo=extinfo, data=data)
-                elif cmd == 323:  # End of LIST
-                    self._event(
-                        "onListEnd", self.addons, origin=origin, endmsg=extinfo, data=data)
-
-                elif cmd == 324:  # Channel Modes
-                    modeparams = params.split()
-                    channame = modeparams.pop(0)
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    if channel.name != channame:
-                        channel.name = channame  # Server seems to have changed the idea of the case of the channel name
-                    setmodes = modeparams.pop(0)
-                    modedelta = []
-                    for mode in setmodes:
-                        if mode == "+":
-                            continue
-                        elif mode in self.supports["CHANMODES"][2]:
-                            param = modeparams.pop(0)
-                            modedelta.append(("+%s" % mode, param))
-                        elif mode in self.supports["CHANMODES"][3]:
-                            modedelta.append(("+%s" % mode, None))
-                    self._event("onChannelModes", self.addons + channel.addons,
-                                channel=channel, modedelta=modedelta, data=data)
-                    for ((modeset, mode), param) in modedelta:
-                        if mode in self.supports["CHANMODES"][2]:
-                            channel.modes[mode] = param
-                        elif mode in self.supports["CHANMODES"][3]:
-                            channel.modes[mode] = True
-
-                elif cmd == 329:  # Channel created
-                    channame, created = params.split()
-                    created = int(created)
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event("onChanCreated", self.addons + channel.addons,
-                                channel=channel, created=created, data=data)
-                    channel.created = int(created)
-
-                elif cmd == 332:  # Channel Topic
-                    channame = params
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event("onTopic", self.addons + channel.addons,
-                                origin=origin, channel=channel, topic=extinfo, data=data)
-                    channel.topic = extinfo
-
-                elif cmd == 333:  # Channel Topic info
-                    (channame, nick, dt) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onTopicInfo", self.addons + channel.addons, origin=origin,
-                        channel=channel, topicsetby=nick, topictime=int(dt), data=data)
-                    channel.topicsetby = nick
-                    channel.topictime = int(dt)
-
-                elif cmd == 352:  # WHO reply
-                    (channame, username, host, serv,
-                     nick, flags) = params.split()
-                    try:
-                        (hops, realname) = extinfo.split(" ", 1)
-                    except ValueError:
-                        hops = extinfo
-                        realname = None
-
-                    chantypes = self.supports.get("CHANTYPES", "&#+!")
-                    if re.match(_chanmatch % re.escape(chantypes), channame):
-                        channel = self.channel(channame)
-                    else:
-                        channel = None
-
-                    user = self.user(nick)
-
-                    if type(channel) == Channel:
-                        self._event("onRecv", channel.addons, **data)
-                        self._event(
-                            "onWhoEntry", self.addons + channel.addons, origin=origin, channel=channel, user=user, channame=channame,
-                            username=username, host=host, serv=serv, nick=nick, flags=flags, hops=int(hops), realname=realname, data=data)
-                    else:
-                        self._event(
-                            "onWhoEntry", self.addons, origin=origin, channel=channel, user=user, channame=channame,
-                            username=username, host=host, serv=serv, nick=nick, flags=flags, hops=int(hops), realname=realname, data=data)
-                    user.hops = hops
-                    user.realname = realname
-                    user.username = username
-                    user.host = host
-                    user.server = serv
-                    user.away = "G" in flags
-                    user.ircop = "*" in flags
-                    if type(channel) == Channel:
-                        if user not in channel.users:
-                            channel.users.append(user)
-                        if channel not in user.channels:
-                            user.channels.append(channel)
-                        for (mode, prefix) in zip(*self.supports["PREFIX"]):
-                            if prefix in flags:
-                                if mode in channel.modes.keys() and user not in channel.modes[mode]:
-                                    channel.modes[mode].append(user)
-                                elif mode not in channel.modes.keys():
-                                    channel.modes[mode] = [user]
-
-                elif cmd == 315:  # End of WHO reply
-                    chantypes = self.supports.get("CHANTYPES", "&#+!")
-                    if re.match(_chanmatch % re.escape(chantypes), params):
-                        channel = self.channel(params)
-                        self._event("onWhoEnd", self.addons + channel.addons,
-                                    origin=origin, param=params, endmsg=extinfo, data=data)
-                    else:
-                        self._event(
-                            "onWhoEnd", self.addons, origin=origin, param=params, endmsg=extinfo, data=data)
-
-                elif cmd == 353:  # NAMES reply
-                    (flag, channame) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-
-                    if self.supports.has_key("PREFIX"):
-                        names = re.findall(
-                            r"([%s]*)([^@!\s]+)(?:!(\S+)@(\S+))?" %
-                            re.escape(self.supports["PREFIX"][1]), extinfo)
-                    else:
-                        names = re.findall(
-                            r"()([^@!\s]+)(?:!(\S+)@(\S+))?", extinfo)
-                                           # Still put it into tuple form for
-                                           # compatibility in the next
-                                           # structure
-                    self._event(
-                        "onNames", self.addons + channel.addons, origin=origin,
-                        channel=channel, flag=flag, channame=channame, nameslist=names, data=data)
-
-                    for (symbs, nick, username, host) in names:
-                        user = self.user(nick)
-                        if user.nick != nick:
-                            user.nick = nick
-                        if username and user.username != username:
-                            user.username = username
-                        if host and user.host != host:
-                            user.host = host
-                        with channel.lock:
-                            if channel not in user.channels:
-                                user.channels.append(channel)
-                            if user not in channel.users:
-                                channel.users.append(user)
-                            if self.supports.has_key("PREFIX"):
-                                for symb in symbs:
-                                    mode = self.supports["PREFIX"][0][
-                                        self.supports["PREFIX"][1].index(symb)]
-                                    if not channel.modes.has_key(mode):
-                                        channel.modes[mode] = [user]
-                                    elif user not in channel.modes[mode]:
-                                        channel.modes[mode].append(user)
-
-                elif cmd == 366:  # End of NAMES reply
-                    channel = self.channel(params)
-                    self._event(
-                        "onNamesEnd", self.addons + channel.addons, origin=origin,
-                        channel=channel, channame=params, endmsg=extinfo, data=data)
-
-                elif cmd == 372:  # MOTD line
-                    self._event(
-                        "onMOTDLine", self.addons, origin=origin, motdline=extinfo, data=data)
-                    self.motd.append(extinfo)
-                elif cmd == 375:  # Begin MOTD
-                    self._event(
-                        "onMOTDStart", self.addons, origin=origin, motdgreet=extinfo, data=data)
-                    self.motdgreet = extinfo
-                    self.motd = []
-                elif cmd == 376:
-                    self._event(
-                        "onMOTDEnd", self.addons, origin=origin, motdend=extinfo, data=data)
-                    self.motdend = extinfo  # End of MOTD
-
-                elif cmd == 386 and "q" in self.supports["PREFIX"][0]:  # Channel Owner (Unreal)
-                    (channame, owner) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    if channel.name != channame:
-                        channel.name = channame  # Server seems to have changed the idea of the case of the channel name
-                    user = self.user(owner)
-                    if user.nick != owner:
-                        user.nick = owner
-                    if channel.modes.has_key("q"):
-                        if user not in channel.modes["q"]:
-                            channel.modes["q"].append(user)
-                    else:
-                        channel.modes["q"] = [user]
-
-                elif cmd == 388 and "a" in self.supports["PREFIX"][0]:  # Channel Admin (Unreal)
-                    (channame, admin) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    if channel.name != channame:
-                        channel.name = channame  # Server seems to have changed the idea of the case of the channel name
-                    user = self.user(admin)
-                    if user.nick != admin:
-                        user.nick = admin
-                    if channel.modes.has_key("a"):
-                        if user not in channel.modes["a"]:
-                            channel.modes["a"].append(user)
-                    else:
-                        channel.modes["a"] = [user]
-
-                elif cmd == "NICK":
-                    newnick = extinfo if len(extinfo) else target
-
-                    addons = reduce(
-                        lambda x, y: x + y, [chan.addons for chan in origin.channels], [])
-                    self._event("onRecv", addons, **data)
-                    self._event(
-                        "onNickChange", self.addons + addons, user=origin, newnick=newnick, data=data)
-                    if origin == self.identity:
-                        self._event(
-                            "onMeNickChange", self.addons + addons, newnick=newnick)
-
-                    for u in self.users:
-                        if u.nick.lower() == newnick.lower():
-                            self.users.remove(
-                                u)  # Nick collision, safe to assume this orphaned user is offline, so we shall remove the old instance.
-                            for channel in self.channels:
-                                # If for some odd reason, the old user still
-                                # appears common channels, then we will remove
-                                # the user anyway.
-                                if u in channel.users:
-                                    channel.users.remove(u)
-                    origin.nick = newnick
-
-                elif cmd == "JOIN":
-                    channel = target if type(
-                        target) == Channel else self.channel(extinfo)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onJoin", self.addons + channel.addons, user=origin, channel=channel, data=data)
-
-                    if origin == self.identity:  # This means the bot is entering the room,
-                        # and will reset all the channel data, on the assumption that such data may have changed.
-                        # Also, the bot must request modes
-                        with channel._joining:
-                            if channel._joinrequested:
-                                channel._joinreply = cmd
-                                channel._joining.notify()
-                        channel._init()
-                        self._event(
-                            "onMeJoin", self.addons + channel.addons, channel=channel)
-                        self._send(u"MODE %s" % channel.name)
-                        self._send(u"WHO %s" % channel.name)
-                        if "CHANMODES" in self.supports.keys():
-                            self._send(
-                                u"MODE %s :%s" % (channel.name, self.supports["CHANMODES"][0]))
-
-                    if channel not in origin.channels:
-                        origin.channels.append(channel)
-                    if origin not in channel.users:
-                        channel.users.append(origin)
-
-                elif cmd == "KICK":
-                    kicked = self.user(params)
-                    if kicked.nick != params:
-                        kicked.nick = params
-
-                    self._event("onRecv", target.addons, **data)
-                    if origin == self.identity:
-                        self._event(
-                            "onMeKick", self.addons + target.addons, channel=target, kicked=kicked, kickmsg=extinfo)
-                    if kicked == self.identity:
-                        self._event("onMeKicked", self.addons + target.addons,
-                                    kicker=origin, channel=target, kickmsg=extinfo)
-                    self._event(
-                        "onKick", self.addons + target.addons, kicker=origin,
-                        channel=target, kicked=kicked, kickmsg=extinfo, data=data)
-
-                    if target in kicked.channels:
-                        kicked.channels.remove(target)
-                    if kicked in target.users:
-                        target.users.remove(kicked)
-                    if self.supports.has_key("PREFIX"):
-                        for mode in self.supports["PREFIX"][0]:
-                            if target.modes.has_key(mode) and kicked in target.modes[mode]:
-                                target.modes[mode].remove(kicked)
-
-                elif cmd == "PART":
-                    try:
-                        self._event("onRecv", target.addons, **data)
-                        if origin == self.identity:
-                            with target._parting:
-                                if target._partrequested:
-                                    target._partreply = cmd
-                                    target._parting.notify()
-                            self._event(
-                                "onMePart", self.addons + target.addons, channel=target, partmsg=extinfo)
-                        self._event("onPart", self.addons + target.addons,
-                                    user=origin, channel=target, partmsg=extinfo, data=data)
-
-                        if target in origin.channels:
-                            origin.channels.remove(target)
-                        if origin in target.users:
-                            target.users.remove(origin)
-                        if self.supports.has_key("PREFIX"):
-                            for mode in self.supports["PREFIX"][0]:
-                                if target.modes.has_key(mode) and origin in target.modes[mode]:
-                                    target.modes[mode].remove(origin)
+                        addons, events = parsemethod(
+                            origin, target, targetprefix, params, extinfo)
                     except:
-                        print target
-                        raise
-                elif cmd == "QUIT":
-                    channels = list(origin.channels)
-                    addons = reduce(
-                        lambda x, y: x + y, [chan.addons for chan in origin.channels], [])
-                    self._event("onRecv", addons, **data)
-                    self._event(
-                        "onQuit", self.addons + addons, user=origin, quitmsg=extinfo, data=data)
-                    for channel in origin.channels:
-                        with channel.lock:
-                            if origin in channel.users:
-                                channel.users.remove(origin)
-                            if self.supports.has_key("PREFIX"):
-                                for mode in self.supports["PREFIX"][0]:
-                                    if channel.modes.has_key(mode) and origin in channel.modes[mode]:
-                                        channel.modes[mode].remove(origin)
-                    origin.channels = []
+                        exc, excmsg, tb = sys.exc_info()
 
-                elif cmd == "MODE":
-                    if type(target) == Channel:
-                        self._event("onRecv", target.addons, **data)
-                        modedelta = []
-                        modeparams = params.split()
-                        setmodes = modeparams.pop(0)
-                        modeset = "+"
-                        for mode in setmodes:
-                            if mode in "+-":
-                                modeset = mode
-                            else:
-                                if mode in self.supports["CHANMODES"][0] + self.supports["CHANMODES"][1]:
-                                    param = modeparams.pop(0)
-                                    modedelta.append(
-                                        ("%s%s" % (modeset, mode), param))
-                                    if mode in _maskmodeeventnames.keys():
-                                        if modeset == "+":
-                                            eventname = _maskmodeeventnames[
-                                                mode][0]
-                                            if mode == "k":
-                                                target.key = param
-                                        if modeset == "-":
-                                            eventname = _maskmodeeventnames[
-                                                mode][1]
-                                            if mode == "k":
-                                                target.key = None
-                                        matchesbot = glob.fnmatch.fnmatch(
-                                            "%s!%s@%s".lower() % (self.identity.nick, self.identity.username, self.identity.host), param.lower())
-                                        self._event(
-                                            "on%s" % eventname, self.addons + target.addons, user=origin, channel=target, banmask=param)
-                                        if matchesbot:
-                                            self._event(
-                                                "onMe%s" % eventname, self.addons + target.addons, user=origin, channel=target, banmask=param)
-                                elif mode in self.supports["CHANMODES"][2]:
-                                    if modeset == "+":
-                                        param = modeparams.pop(0)
-                                        modedelta.append(
-                                            ("%s%s" % (modeset, mode), param))
-                                    else:
-                                        modedelta.append(
-                                            ("%s%s" % (modeset, mode), None))
-                                elif mode in self.supports["CHANMODES"][3]:
-                                    modedelta.append(
-                                        ("%s%s" % (modeset, mode), None))
-                                elif self.supports.has_key("PREFIX") and mode in self.supports["PREFIX"][0]:
-                                    modenick = modeparams.pop(0)
-                                    modeuser = self.user(modenick)
-                                    if mode in _privmodeeventnames.keys():
-                                        if modeset == "+":
-                                            eventname = _privmodeeventnames[
-                                                mode][0]
-                                        if modeset == "-":
-                                            eventname = _privmodeeventnames[
-                                                mode][1]
-                                        self._event(
-                                            "on%s" % eventname, self.addons + target.addons, user=origin, channel=target, modeuser=modeuser)
-                                        if modeuser == self.identity:
-                                            self._event(
-                                                "onMe%s" % eventname, self.addons + target.addons, user=origin, channel=target)
-                                    modedelta.append(
-                                        ("%s%s" % (modeset, mode), modeuser))
-                        self._event(
-                            "onChanModeSet", self.addons + target.addons,
-                            user=origin, channel=target, modedelta=modedelta, data=data)
-                        with target.lock:
-                            for ((modeset, mode), param) in modedelta:
-                                if mode in self.supports["CHANMODES"][0]:
-                                    if modeset == "+":
-                                        if target.modes.has_key(mode):
-                                            if param.lower() not in [mask.lower() for (mask, setby, settime) in target.modes[mode]]:
-                                                target.modes[mode].append(
-                                                    (param, origin, int(time.time())))
-                                        else:
-                                            target.modes[mode] = [
-                                                (param, origin, int(time.time()))]
-                                    else:
-                                        if mode in target.modes.keys():
-                                            if mode == "b":  # Inspircd mode is case insentive when unsetting the mode
-                                                masks = [
-                                                    mask.lower() for (mask, setby, settime) in target.modes[mode]]
-                                                if param.lower() in masks:
-                                                    index = masks.index(
-                                                        param.lower())
-                                                    # print "Index: %d"%index
-                                                    del target.modes[
-                                                        mode][index]
-                                            else:
-                                                masks = [
-                                                    mask for (mask, setby, settime) in target.modes[mode]]
-                                                if param in masks:
-                                                    index = masks.index(param)
-                                                    del target.modes[
-                                                        mode][index]
-                                elif mode in self.supports["CHANMODES"][1]:
-                                    if modeset == "+":
-                                        target.modes[mode] = param
-                                    else:
-                                        target.modes[mode] = None
-                                elif mode in self.supports["CHANMODES"][2]:
-                                    if modeset == "+":
-                                        target.modes[mode] = param
-                                    else:
-                                        target.modes[mode] = None
-                                elif mode in self.supports["CHANMODES"][3]:
-                                    if modeset == "+":
-                                        target.modes[mode] = True
-                                    else:
-                                        target.modes[mode] = False
-                                elif self.supports.has_key("PREFIX") and mode in self.supports["PREFIX"][0]:
-                                    if modeset == "+":
-                                        if target.modes.has_key(mode) and param not in target.modes[mode]:
-                                            target.modes[mode].append(param)
-                                        if not target.modes.has_key(mode):
-                                            target.modes[mode] = [param]
-                                    elif target.modes.has_key(mode) and param in target.modes[mode]:
-                                        target.modes[mode].remove(param)
-                    elif target == self.identity:
-                        modeparams = (params if params else extinfo).split()
-                        setmodes = modeparams.pop(0)
-                        modedelta = []
-                        modeset = "+"
-                        for mode in setmodes:
-                            if mode in "+-":
-                                modeset = mode
-                                continue
-                            if modeset == "+":
-                                if mode == "s":
-                                    if len(modeparams):
-                                        snomask = modeparams.pop(0)
-                                        snomaskdelta = []
-                                        snomodeset = "+"
-                                        for snomode in snomask:
-                                            if snomode in "+-":
-                                                snomodeset = snomode
-                                                continue
-                                            snomaskdelta.append(
-                                                "%s%s" % (snomodeset, snomode))
-                                        modedelta.append(("+s", snomaskdelta))
-                                    else:
-                                        modedelta.append(("+s", []))
-                                else:
-                                    modedelta.append(("+%s" % mode, None))
-                            if modeset == "-":
-                                modedelta.append(("-%s" % mode, None))
-                        self._event(
-                            "onUserModeSet", self.addons, origin=origin, modedelta=modedelta, data=data)
-                        for ((modeset, mode), param) in modedelta:
-                            if modeset == "+":
-                                if mode not in target.modes:
-                                    target.modes += mode
-                                if mode == "s":
-                                    for snomodeset, snomode in param:
-                                        if snomodeset == "+" and snomode not in target.snomask:
-                                            target.snomask += snomode
-                                        if snomodeset == "-" and snomode in target.snomask:
-                                            target.snomask = target.snomask.replace(
-                                                snomode, "")
-                            if modeset == "-":
-                                if mode in target.modes:
-                                    target.modes = target.modes.replace(
-                                        mode, "")
-                                if mode == "s":
-                                    target.snomask = ""
-
-                elif cmd == "TOPIC":
-                    self._event("onRecv", target.addons, **data)
-                    self._event("onTopicSet", self.addons + target.addons,
-                                user=origin, channel=target, topic=extinfo, data=data)
-
-                    with target.lock:
-                        target.topic = extinfo
-                        target.topicsetby = origin
-                        target.topictime = int(time.time())
-
-                elif cmd == "INVITE":
-                    channel = self.channel(extinfo if extinfo else params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onInvite", self.addons + channel.addons, user=origin, channel=channel, data=data)
-
-                elif cmd == "PRIVMSG":
-                    if type(target) == Channel:
-                        self._event("onRecv", target.addons, **data)
-
-                    # CTCP handling
-                    ctcp = re.findall(_ctcpmatch, extinfo)
-                    if ctcp:
-                        (ctcptype, ext) = ctcp[0]
-                        if ctcptype.upper() == "ACTION":
-                            if type(target) == Channel:
-                                self._event(
-                                    "onChanAction", self.addons + target.addons, user=origin,
-                                    channel=target, targetprefix=targetprefix, action=ext, data=data)
-                            elif target == self.identity:
-                                self._event(
-                                    "onPrivAction", self.addons, user=origin, action=ext, data=data)
-                        else:
-                            if type(target) == Channel:
-                                self._event(
-                                    "onChanCTCP", self.addons + target.addons, user=origin, channel=target,
-                                    targetprefix=targetprefix, ctcptype=ctcptype, params=ext, data=data)
-                            elif target == self.identity:
-                                self._event(
-                                    "onPrivCTCP", self.addons, user=origin, ctcptype=ctcptype, params=ext, data=data)
-                        if ctcptype.upper() == "VERSION":
-                            origin.ctcpreply("VERSION", self.ctcpversion())
-                        if ctcptype.upper() == "TIME":
-                            tformat = time.ctime()
-                            tz = time.tzname[0]
-                            origin.ctcpreply(
-                                "TIME", "%(tformat)s %(tz)s" % vars())
-                        if ctcptype.upper() == "PING":
-                            origin.ctcpreply("PING", "%(ext)s" % vars())
-                        if ctcptype.upper() == "FINGER":
-                            origin.ctcpreply("FINGER", "%(ext)s" % vars())
+                        # Print to log AND stderr
+                        tblines = [
+                            u"!!! There was an error in parsing the following line:", u"!!! %s" % line]
+                        for tbline in traceback.format_exc().split("\n"):
+                            tblines.append(u"!!! %s" % autodecode(tbline))
+                        self.logwrite(*tblines)
+                        print >>sys.stderr, u"There was an error in parsing the following line:"
+                        print >>sys.stderr, u"%s" % line
+                        print >>sys.stderr, traceback.format_exc()
+                        return
+                else:
+                    addons = self.addons
+                    if type(cmd) == int:
+                        events = [
+                            ("on%03d" % cmd, dict(line=line, origin=origin, target=target, params=params, extinfo=extinfo), True)]
                     else:
-                        if type(target) == Channel:
-                            self._event(
-                                "onChanMsg", self.addons + target.addons, user=origin,
-                                channel=target, targetprefix=targetprefix, msg=extinfo, data=data)
-                        elif target == self.identity:
-                            self._event(
-                                "onPrivMsg", self.addons, user=origin, msg=extinfo, data=data)
+                        events = [
+                            ("on%s" % cmd.upper(), dict(line=line, origin=origin, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo), True)]
 
-                elif cmd == "NOTICE":
-                    if type(target) == Channel:
-                        self._event("onRecv", target.addons, **data)
+                # Supress pings and pongs if self.quietpingpong is set to True
+                if cmd in ("PING", "PONG") and self.quietpingpong:
+                    return
 
-                    # CTCP handling
-                    ctcp = re.findall(_ctcpmatch, extinfo)
-                    if ctcp and target == self.identity:
-                        (ctcptype, ext) = ctcp[0]
-                        self._event(
-                            "onCTCPReply", self.addons, origin=origin, ctcptype=ctcptype, params=ext, data=data)
-                    else:
-                        if type(target) == Channel:
-                            self._event(
-                                "onChanNotice", self.addons + target.addons, origin=origin,
-                                channel=target, targetprefix=targetprefix, msg=extinfo, data=data)
-                        elif target == self.identity:
-                            self._event(
-                                "onPrivNotice", self.addons, origin=origin, msg=extinfo, data=data)
+                # Send parsed data to addons having onRecv method first
+                self._event(
+                    addons + [self], [("onRecv", dict(line=line, **data), False)], line, data)
 
-                elif cmd == 367:  # Channel Ban list
-                    (channame, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onBanListEntry", self.addons + channel.addons, origin=origin,
-                        channel=channel, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "b" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
-                            channel.modes["b"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["b"] = [(mask, setby, int(settime))]
-                elif cmd == 368:
-                    channel = self.channel(params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event("onBanListEnd", self.addons + channel.addons,
-                                origin=origin, channel=channel, endmsg=extinfo, data=data)
+                # Support for further addon events is taken care of here. We also treat the irc.Connection instance itself as an addon for the purpose of
+                # tracking the IRC state, and should be invoked *last*.
+                self._event(addons + [self], events, line, data)
 
-                elif cmd == 346:  # Channel Invite list
-                    (channame, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onInviteListEntry", self.addons + channel.addons, origin=origin,
-                        channel=channel, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "I" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["I"]]:
-                            channel.modes["I"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["I"] = [(mask, setby, int(settime))]
-                elif cmd == 347:
-                    channel = self.channel(params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onInviteListEnd", self.addons + channel.addons,
-                        origin=origin, channel=channel, endmsg=extinfo, data=data)
-
-                elif cmd == 348:  # Channel Ban Exception list
-                    (channame, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onBanExceptListEntry", self.addons + channel.addons, origin=origin,
-                        channel=channel, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "e" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["e"]]:
-                            channel.modes["e"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["e"] = [(mask, setby, int(settime))]
-                elif cmd == 349:
-                    channel = self.channel(params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onBanExceptListEnd", self.addons + channel.addons,
-                        origin=origin, channel=channel, endmsg=extinfo, data=data)
-
-                elif cmd == 910:  # Channel Access List
-                    (channame, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onAccessListEntry", self.addons + channel.addons, origin=origin,
-                        channel=channel, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "w" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
-                            channel.modes["w"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["w"] = [(mask, setby, int(settime))]
-                elif cmd == 911:
-                    channel = self.channel(params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onAccessListEnd", self.addons + channel.addons,
-                        origin=origin, channel=channel, endmsg=extinfo, data=data)
-
-                elif cmd == 941:  # Spam Filter list
-                    (channame, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onSpamfilterListEntry", self.addons + channel.addons, origin=origin,
-                        channel=channel, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "g" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["g"]]:
-                            channel.modes["g"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["g"] = [(mask, setby, int(settime))]
-                elif cmd == 940:
-                    channel = self.channel(params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onSpamfilterListEnd", self.addons + channel.addons,
-                        origin=origin, channel=channel, endmsg=extinfo, data=data)
-
-                elif cmd == 954:  # Channel exemptchanops list
-                    (channame, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onExemptChanOpsListEntry", self.addons + channel.addons, origin=origin,
-                        channel=channel, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "X" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["X"]]:
-                            channel.modes["X"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["X"] = [(mask, setby, int(settime))]
-                elif cmd == 953:
-                    channel = self.channel(params)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onExemptChanOpsListEnd", self.addons + channel.addons,
-                        origin=origin, channel=channel, endmsg=extinfo, data=data)
-
-                elif cmd == 728:  # Channel quiet list
-                    (channame, modechar, mask, setby, settime) = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onQuietListEntry", self.addons + channel.addons, origin=origin, channel=channel,
-                        modechar=modechar, mask=mask, setby=setby, settime=int(settime), data=data)
-                    if "q" in channel.modes.keys():
-                        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["q"]]:
-                            channel.modes["q"].append(
-                                (mask, setby, int(settime)))
-                    else:
-                        channel.modes["q"] = [(mask, setby, int(settime))]
-                elif cmd == 729:
-                    channame, modechar = params.split()
-                    channel = self.channel(channame)
-                    self._event("onRecv", channel.addons, **data)
-                    self._event(
-                        "onQuietListEnd", self.addons + channel.addons, channel=channel, endmsg=extinfo, data=data)
-
-                elif cmd in (495, 384, 385, 386, 468, 470, 366, 315, 482, 484, 953, 368, 482, 349, 940, 911, 489, 490, 492, 520, 530):  # Channels which appear in params
-                    for param in params.split():
-                        if len(param) and param[0] in self.supports["CHANTYPES"]:
-                            channel = self.channel(param)
-                            self._event("onRecv", channel.addons, **data)
-
-                elif type(cmd) == int:
-                    self._event(
-                        "on%03d" % cmd, self.addons, line=line, origin=origin,
-                        target=target, params=params, extinfo=extinfo, data=data)
-                elif not (cmd in ("PING", "PONG") and self.quietpingpong):
-                    self._event(
-                        "on%s" % cmd, self.addons, line=line, origin=origin,
-                        cmd=cmd, target=target, params=params, extinfo=extinfo, data=data)
-
-                if cmd in (384, 403, 405, 471, 473, 474, 475, 476, 520, 477, 489, 495):  # Channel Join denied
-                    try:
-                        channel = self.channel(params)
-                    except InvalidName:
-                        pass
-                    else:
-                        with channel._joining:
-                            if channel._joinrequested:
-                                channel._joinreply = (cmd, extinfo)
-                                channel._joining.notify()
-
-                elif cmd == 470:  # Channel Join denied due to redirect
-                    channelname, redirect = params.split()
-                    try:
-                        channel = self.channel(channelname)
-                    except InvalidName:
-                        pass
-                    else:
-                        with channel._joining:
-                            if channel._joinrequested:
-                                channel._joinreply = (
-                                    cmd, "%s (%s)" % (extinfo, redirect))
-                                channel._joining.notify()
-
-                # Handle events that were not handled.
-                # if not (cmd in ("PING", "PONG") and self.quietpingpong):
-                #	self._event("onUnhandled", unhandled, line=line, origin=origin, cmd=cmd, target=target, params=params, extinfo=extinfo)
-
-    def _trynick(self):
-        (q, s) = divmod(self.trynick, len(self.nick))
-        nick = self.nick[s]
-        if q > 0:
-            nick = "%s%d" % (nick, q)
-        self._send(u"NICK %s" % nick)
-        self.trynick += 1
-
-    def _recvhandler(self, server=None, port=None, ssl=None, ipv6=None):
-        pingreq = None
-        # Enforce that this function must only be run from within
-        # self._sendhandlerthread.
-        if currentThread() != self._recvhandlerthread:
+    def _recvhandler(self, server, port, ipvers, secure):
+        if currentThread() != self._recvhandlerthread:  # Enforce that this function must only be run from within self._sendhandlerthread.
             raise RuntimeError, "This function is designed to run in its own thread."
-        server = self.server
-        if self.ipv6 and ":" in server:
-            server = "[%s]" % server
-        port = self.port
 
         try:
             with self.lock:
-                self._event("onSessionOpen", self.addons + reduce(
-                    lambda x, y: x + y, [chan.addons for chan in self.channels], []))
+                self._event(self.getalladdons(), [
+                            ("onSessionOpen", dict(), False)])
 
-            self.logwrite("### Log session started")
-            while True:  # Autoreconnect loop
+            self.logwrite("### Session started")
+
+            ipvers = ipvers if type(ipvers) == tuple else (ipvers,)
+
+            # Autoreconnect loop
+            while True:
                 attempt = 1
-                while True:  # Autoretry loop
-                    try:
-                        self._connect()
+
+                # Autoretry loop
+                while True:
+                    servisip = False
+                    for ipver in ipvers:  # Check to see if address is a valid ip address instead of host name
+                        try:
+                            socket.inet_pton(ipver, server)
+                        except socket.error:
+                            continue  # Not a valid ip address under this ipver.
+                        # Is a valid ip address under this ipver.
+                        if ipver == socket.AF_INET6:
+                            self._tryaddrs(
+                                server, [(server, port, 0, 0)], ipver, secure)
+                        else:
+                            ret = self._tryaddrs(
+                                server, [(server, port)], ipver, secure)
+                        servisip = True
                         break
-                    except socket.error:
+                    # Otherwise, we assume server is a hostname
+                    if not servisip:
+                        ret = self._tryipvers(server, port, ipvers, secure)
+                    if ret:
+                        self.server = server
+                        self.port = port
+                        self.ipvers = ipvers
+                        self.secure = secure
+                        break
+                    if self._quitexpected:
+                        sys.exit()
+                    if self.retrysleep > 0:
+                        time.sleep(self.retrysleep)
+                    if self._quitexpected:
+                        sys.exit()
+                    if attempt < self.maxretries or self.maxretries < 0:
                         if self._quitexpected:
                             sys.exit()
-                        if attempt < self.maxretries or self.maxretries < 0:
-                            if self.retrysleep > 0:
-                                time.sleep(self.retrysleep)
-                            if self._quitexpected:
-                                sys.exit()
-                            attempt += 1
-                        else:
-                            self.logwrite(
-                                "*** Maximum number of attempts reached. Giving up. (%(server)s:%(port)s)" % vars())
-                            sys.exit()
+                        attempt += 1
+                    else:
+                        self.logwrite(
+                            "*** Maximum number of attempts reached. Giving up. (%(server)s:%(port)s)" % vars())
+                        with self._connecting:
+                            self._connecting.notifyAll()
+                        sys.exit()
 
                 # Connection succeeded
                 try:
+                    pingreq = None
                     with self._sendline:
                         self._sendline.notify()
 
@@ -1481,13 +876,8 @@ class Connection(object):
                                     string.split(readbuf[0:lastlf], "\n"))
                                 readbuf = readbuf[lastlf + 1:]
 
-                        line = string.rstrip(linebuf.pop(0))
-                        try:
-                            line = line.decode("utf8")
-                        except UnicodeDecodeError:
-                            # Attempt to figure encoding
-                            charset = chardet.detect(line)['encoding']
-                            line = line.decode(charset)
+                        line = linebuf.pop(0).rstrip("\r")
+                        line = autodecode(line)
                         self._procrecvline(line)
 
                 except SystemExit:  # Connection lost normally.
@@ -1498,8 +888,8 @@ class Connection(object):
                     with self.lock:
                         self.logwrite(
                             "*** Connection to %(server)s:%(port)s failed: %(excmsg)s." % vars())
-                        self._event("onConnectFail", self.addons + reduce(
-                            lambda x, y: x + y, [chan.addons for chan in self.channels], []), exc=exc, excmsg=excmsg, tb=tb)
+                        self._event(self.getalladdons(), [
+                                    ("onConnectFail", dict(exc=exc, excmsg=excmsg, tb=tb), False)])
 
                 except:  # Unknown exception, treated as FATAL. Try to quit IRC and terminate thread with exception.
                     # Quit with a (hopefully) useful quit message, or die
@@ -1513,19 +903,15 @@ class Connection(object):
                     raise
 
                 finally:  # Post-connection operations after connection is lost, and must be executed, even if exception occurred.
-                    with self._sendline:
+                    with self._sendline:  # Notify _outgoingthread that the connection has been terminated.
                         self._outgoing.clear()
                         self._sendline.notify()
-                    with self.lock:
-                        self._event("onDisconnect", self.addons + reduce(
-                            lambda x, y: x + y, [chan.addons for chan in self.channels], []), expected=self._quitexpected)
+                    with self._disconnecting:
+                        self._disconnecting.notifyAll()
+                        self._event(self.getalladdons(), [
+                                    ("onDisconnect", dict(expected=self._quitexpected), False)])
 
                         self._init()
-
-                    # Notify _outgoingthread that the connection has been
-                    # terminated.
-                    with self._sendline:
-                        self._sendline.notify()
 
                     try:
                         self._connection.close()
@@ -1549,18 +935,1164 @@ class Connection(object):
             sys.exit()
 
         finally:
-            self.logwrite("### Log session ended")
-            self._event("onSessionClose", self.addons + reduce(
-                lambda x, y: x + y, [chan.addons for chan in self.channels], []))
+            self.logwrite("### Session ended")
+            self._event(self.getalladdons(), [
+                        ("onSessionClose", dict(), False)])
 
             # Tell _sendhandler to quit
             with self._sendline:
                 self._outgoing.append("quit")
                 self._sendline.notify()
 
+    # Gets a list of *all* addons, including channel-specific addons.
+    def getalladdons(self):
+        return self.addons + reduce(lambda x, y: x + y, [chan.addons for chan in self.channels], [])
+
+    # The following methods matching parse* are used to determine what addon methods will be called, and prepares the arguments to be passed.
+    # These methods can also be used to determine event support by invoking
+    # them with no parameters. This allows for addition of event supports.
+    # Each is expected to return a tuple (addons, [(method, args, fallback), ...]).
+    # 'addons' refers to the list of addons whose methods should be called.
+    # [(method, args, fallback), ...] is a list of methods and parameters to be called, as well as a flag to determine when a fallback is permitted.
+    # 'method' refers to the name of the method to be invoked in the addons
+    # 'args' is a dict of arguments that should be passed as parameters to event.
+    # 'fallback' is a flag to determine when a fallback to 'onOther' is permitted.
+    # Each of these functions should allow passing None to all arguments, in
+    # which case, should report back *all* supported methods.
+    def parse001(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        return (self.getalladdons(), [("onWelcome", dict(origin=origin, msg=extinfo), True)])
+
+    def parse002(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        return (self.getalladdons(), [("onYourHost", dict(origin=origin, msg=extinfo), True)])
+
+    def parse003(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        return (self.getalladdons(), [("onServerCreated", dict(origin=origin, msg=extinfo), True)])
+
+    def parse004(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        return (self.getalladdons(), [("onServInfo", dict(origin=origin, servinfo=params), True)])
+
+    def parse005(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Server Supports
+        if origin == None:
+            return (None, [("onSupports", dict(origin=None, supports=None, msg=None), True)])
+        support = dict(re.findall("([A-Za-z0-9]+)(?:=(\\S*))?", params))
+        if support.has_key("CHANMODES"):
+            support["CHANMODES"] = support["CHANMODES"].split(",")
+        if support.has_key("PREFIX"):
+            matches = re.findall(_prefixmatch, support["PREFIX"])
+            if matches:
+                support["PREFIX"] = matches[0]
+            else:
+                del support["PREFIX"]
+                    # Might as well delete the info if it doesn't match
+                    # expected pattern
+        return (self.getalladdons(), [("onSupports", dict(origin=origin, supports=support, msg=extinfo), True)])
+
+    def parse008(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Snomask
+        if origin == None:
+            return (None, [("onSnoMask", dict(origin=None, snomask=None), True)])
+        snomask = params.lstrip("+")
+        return (self.getalladdons(), [("onSnoMask", dict(origin=origin, snomask=snomask), True)])
+
+    def parse221(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # User Modes
+        if origin == None:
+            return (self.getalladdons(), [("onUserModes", dict(origin=None, modes=None), True)])
+        modes = (params if params else extinfo).lstrip("+")
+        return (self.getalladdons(), [("onUserModes", dict(origin=origin, modes=modes), True)])
+
+    def parse251(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Net Stats
+        return (self.addons, [("onNetStats", dict(origin=origin, netstats=extinfo), True)])
+
+    def parse252(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Operator count
+        if origin == None:
+            return (None, [("onOpCount", dict(origin=None, opcount=None), True)])
+        opcount = int(params)
+        return (self.addons, [("onOpCount", dict(origin=origin, opcount=opcount), True)])
+
+    def parse254(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Count
+        if origin == None:
+            return (self.addons, [("onChanCount", dict(origin=None, chancount=None), True)])
+        chancount = int(params)
+        return (self.addons, [("onChanCount", dict(origin=origin, chancount=chancount), True)])
+
+    def parse305(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Returned from away status
+        return (self.getalladdons(), [("onReturn", dict(origin=origin, msg=extinfo), True)])
+
+    def parse306(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Entered away status
+        return (self.getalladdons(), [("onAway", dict(origin=origin, msg=extinfo), True)])
+
+    def parse311(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Start of WHOIS data
+        if origin == None:
+            return (None, [("onWhoisStart", dict(origin=None, user=None, nickname=None, username=None, host=None, realname=None), True)])
+        nickname, username, host, star = params.split()
+        user = self.user(nickname)
+        return (self.addons, [("onWhoisStart", dict(origin=origin, user=user, nickname=nickname, username=username, host=host, realname=extinfo), True)])
+
+    def parse301(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Away Message
+        if origin == None:
+            return (None, [("onWhoisAway", dict(origin=None, user=None, nickname=None, awaymsg=None), True)])
+        user = self.user(params)
+        return (self.addons, [("onWhoisAway", dict(origin=origin, user=user, nickname=params, awaymsg=extinfo), True)])
+
+    def parse303(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # ISON Reply
+        if origin == None:
+            return (None, [("onIsonReply", dict(origin=None, isonusers=None), True)])
+        users = [self.user(user) for user in extinfo.split(" ")]
+        return (self.addons, [("onIsonReply", dict(origin=origin, isonusers=users), True)])
+
+    def parse307(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Is a registered nick
+        if origin == None:
+            return (None, [("onWhoisRegisteredNick", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        return (self.addons, [("onWhoisRegisteredNick", dict(origin=origin, user=self.user(params), nickname=params, msg=extinfo), True)])
+
+    def parse378(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Connecting From
+        if origin == None:
+            return (None, [("onWhoisConnectingFrom", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        return (self.addons, [("onWhoisConnectingFrom", dict(origin=origin, user=self.user(params), nickname=params, msg=extinfo), True)])
+
+    def parse319(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channels
+        if origin == None:
+            return (None, [("onWhoisChannels", dict(origin=None, user=None, nickname=None, chanlist=None), True)])
+        return (self.addons, [("onWhoisChannels", dict(origin=origin, user=self.user(params), nickname=params, chanlist=extinfo.split(" ")), True)])
+
+    def parse310(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Availability
+        if origin == None:
+            return (None, [("onWhoisAvailability", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        return (self.addons, [("onWhoisAvailability", dict(origin=origin, user=self.user(params), nickname=params, msg=extinfo), True)])
+
+    def parse312(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Server
+        if origin == None:
+            return (None, [("onWhoisServer", dict(origin=None, user=None, nickname=None, server=None, servername=None), True)])
+        nickname, server = params.split(" ")
+        user = self.user(nickname)
+        return (self.addons, [("onWhoisServer", dict(origin=origin, user=user, nickname=nickname, server=server, servername=extinfo), True)])
+
+    def parse313(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # IRC Op
+        if origin == None:
+            return (None, [("onWhoisOp", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        user = self.user(params)
+        return (self.addons, [("onWhoisOp", dict(origin=origin, user=user, nickname=params, msg=extinfo), True)])
+
+    def parse317(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Idle and Signon times
+        if origin == None:
+            return (None, [("onWhoisTimes", dict(origin=None, user=None, nickname=None, idletime=None, signontime=None, msg=None), True)])
+        nickname, idletime, signontime = params.split(" ")
+        user = self.user(nickname)
+        return (self.addons, [("onWhoisTimes", dict(origin=origin, user=user, nickname=nickname, idletime=int(idletime), signontime=int(signontime), msg=extinfo), True)])
+
+    def parse671(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # SSL
+        if origin == None:
+            return (None, [("onWhoisSSL", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        user = self.user(params)
+        return (self.addons, [("onWhoisSSL", dict(origin=origin, user=user, nickname=params, msg=extinfo), True)])
+
+    def parse379(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # User modes
+        if origin == None:
+            return (None, [("onWhoisModes", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        return (self.addons, [("onWhoisModes", dict(origin=origin, user=self.user(params), nickname=params, msg=extinfo), True)])
+
+    def parse330(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Logged in as
+        if origin == None:
+            return (None, [("onWhoisLoggedInAs", dict(origin=None, user=None, nickname=None, loggedinas=None, msg=None), True)])
+        nickname, loggedinas = params.split(" ")
+        user = self.user(nickname)
+        return (self.addons, [("onWhoisLoggedInAs", dict(origin=origin, user=user, nickname=nickname, loggedinas=loggedinas, msg=extinfo), True)])
+
+    def parse318(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # End of WHOIS
+        if origin == None:
+            return (None, [("onWhoisEnd", dict(origin=None, user=None, nickname=None, msg=None), True)])
+        try:
+            user = self.user(params)
+        except InvalidName:
+            user = params
+        return (self.addons, [("onWhoisEnd", dict(origin=origin, user=user, nickname=params, msg=extinfo), True)])
+
+    def parse321(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Start LIST
+        return (None, [("onListStart", dict(origin=origin, params=params, extinfo=extinfo), True)])
+
+    def parse322(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # LIST item
+        if origin == None:
+            return (None, [("onListEntry", dict(origin=None, channel=None, population=None, extinfo=None), True)])
+        (chan, pop) = params.split(" ", 1)
+        try:
+            return (self.addons, [("onListEntry", dict(origin=origin, channel=self.channel(chan), population=int(pop), extinfo=extinfo), True)])
+        except:
+            return (self.addons, [("onListEntry", dict(origin=origin, channel=chan, population=int(pop), extinfo=extinfo), True)])
+
+    def parse323(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # End of LIST
+        return (None, [("onListEnd", dict(origin=None, endmsg=None), True)])
+
+    def parse324(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Modes
+        if origin == None:
+            return (None, [("onChannelModes", dict(origin=None, channel=None, modedelta=None), True)])
+        modeparams = params.split()
+        channame = modeparams.pop(0)
+        channel = self.channel(channame)
+
+        chanmodes = self.supports.get("CHANMODES", _defaultchanmodes)
+        setmodes = modeparams.pop(0)
+        modedelta = []
+        for mode in setmodes:
+            if mode == "+":
+                continue
+            elif mode in [2]:
+                param = modeparams.pop(0)
+                modedelta.append(("+%s" % mode, param))
+            elif mode in chanmodes[3]:
+                modedelta.append(("+%s" % mode, None))
+        return (self.addons + channel.addons, [("onChannelModes", dict(origin=origin, channel=channel, modedelta=modedelta), True)])
+
+    def parse329(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel created
+        if origin == None:
+            return (None, [("onChanCreated", dict(origin=None, channel=None, created=None), True)])
+        channame, created = params.split()
+        created = int(created)
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onChanCreated", dict(origin=origin, channel=channel, created=created), True)])
+
+    def parse332(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Topic
+        if origin == None:
+            return (None, [("onTopic", dict(origin=None, channel=None, topic=None), True)])
+        channame = params
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onTopic", dict(origin=origin, channel=channel, topic=extinfo), True)])
+
+    def parse333(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Topic info
+        if origin == None:
+            return (None, [("onTopicInfo", dict(origin=None, channel=None, topicsetby=None, topictime=None), True)])
+        (channame, nick, dt) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onTopicInfo", dict(origin=origin, channel=channel, topicsetby=nick, topictime=int(dt)), True)])
+
+    def parse352(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # WHO reply
+        if origin == None:
+            return (None, [("onWhoEntry", dict(origin=None, channel=None, user=None, channame=None, username=None, host=None, serv=None, nick=None, flags=None, hops=None, realname=None), True)])
+        (channame, username, host, serv, nick, flags) = params.split()
+        try:
+            (hops, realname) = extinfo.split(" ", 1)
+        except ValueError:
+            hops = extinfo
+            realname = None
+
+        chantypes = self.supports.get("CHANTYPES", _defaultchantypes)
+        if re.match(_chanmatch % re.escape(chantypes), channame):
+            channel = self.channel(channame)
+        else:
+            channel = None
+
+        user = self.user(nick)
+
+        if type(channel) == Channel:
+            return (self.addons + channel.addons, [("onWhoEntry", dict(origin=origin, channel=channel, user=user, channame=channame, username=username, host=host, serv=serv, nick=nick, flags=flags, hops=int(hops), realname=realname), True)])
+        else:
+            return (self.addons, [("onWhoEntry", dict(origin=origin, channel=channel, user=user, channame=channame, username=username, host=host, serv=serv, nick=nick, flags=flags, hops=int(hops), realname=realname), True)])
+
+    def parse315(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # End of WHO reply
+        if origin == None:
+            return (None, [("onWhoEnd", dict(origin=None, param=None, endmsg=None), True)])
+        chantypes = self.supports.get("CHANTYPES", _defaultchantypes)
+        if re.match(_chanmatch % re.escape(chantypes), params):
+            channel = self.channel(params)
+            return (self.addons + channel.addons, [("onWhoEnd", dict(origin=origin, param=params, endmsg=extinfo), True)])
+        else:
+            return (self.addons, [("onWhoEnd", dict(origin=origin, param=params, endmsg=extinfo), True)])
+
+    def parse353(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # NAMES reply
+        if origin == None:
+            return (None, [("onNames", dict(origin=None, channel=None, flag=None, channame=None, nameslist=None), True)])
+        (flag, channame) = params.split()
+        channel = self.channel(channame)
+
+        if self.supports.has_key("PREFIX"):
+            names = re.findall(r"([%s]*)([^@!\s]+)(?:!(\S+)@(\S+))?" %
+                               re.escape(self.supports["PREFIX"][1]), extinfo)
+        else:
+            names = re.findall(r"()([^@!\s]+)(?:!(\S+)@(\S+))?", extinfo)
+                               # Still put it into tuple form for compatibility
+                               # in the next structure
+        return (self.addons + channel.addons, [("onNames", dict(origin=origin, channel=channel, flag=flag, channame=channame, nameslist=names), True)])
+
+    def parse366(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # End of NAMES reply
+        if origin == None:
+            return (None, [("onNamesEnd", dict(origin=None, channel=None, channame=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onNamesEnd", dict(origin=origin, channel=channel, channame=params, endmsg=extinfo), True)])
+
+    def parse372(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # MOTD line
+        return (self.addons, [("onMOTDLine", dict(origin=origin, motdline=extinfo), True)])
+        self.motd.append(extinfo)
+
+    def parse375(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Begin MOTD
+        return (self.addons, [("onMOTDStart", dict(origin=origin, motdgreet=extinfo), True)])
+
+    def parse376(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        return (self.addons, [("onMOTDEnd", dict(origin=origin, motdend=extinfo), True)])
+
+    def parseNICK(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+
+        if origin == None:
+            return (None, [
+                    ("onNickChange", dict(user=None, newnick=None), True),
+                    ("onMeNickChange", dict(newnick=None), False)
+                    ])
+
+        newnick = extinfo if len(extinfo) else target
+
+        addons = reduce(
+            lambda x, y: x + y, [channel.addons for channel in origin.channels if self.identity in channel.users], [])
+
+        if origin == self.identity:
+            return (self.addons + addons, [
+                    ("onNickChange", dict(user=origin, newnick=newnick), True),
+                    ("onMeNickChange", dict(newnick=newnick), False)
+                    ])
+        return (self.addons + addons, [("onNickChange", dict(user=origin, newnick=newnick), True)])
+
+    def parseJOIN(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+
+        if origin == None:
+            return (None, [
+                    ("onMeJoin", dict(channel=None), False),
+                    ("onJoin", dict(user=None, channel=None), True)
+                    ])
+
+        if type(target) == Channel:
+            channel = target
+        else:
+            channel = self.channel(extinfo)
+            channel.name = extinfo
+
+        if origin == self.identity:
+            return (self.addons + channel.addons, [
+                    ("onMeJoin", dict(channel=channel), False),
+                    ("onJoin", dict(user=origin, channel=channel), True),
+                    ])
+
+        return (self.addons + channel.addons, [("onJoin", dict(user=origin, channel=channel), True)])
+
+    def parseKICK(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [
+                    ("onMeKick", dict(channel=None, kicked=None, kickmsg=None), True),
+                    ("onMeKicked", dict(
+                        kicker=None, channel=None, kickmsg=None), True),
+                    ("onKick", dict(kicker=None, channel=None, kicked=None, kickmsg=None), True)
+                    ])
+        events = []
+        if origin == self.identity:
+            events.append(
+                ("onMeKick", dict(channel=target, kicked=kicked, kickmsg=extinfo), False))
+
+        kicked = self.user(params)
+        if kicked.nick != params:
+            kicked.nick = params
+
+        if kicked == self.identity:
+            events.append(
+                ("onMeKicked", dict(kicker=origin, channel=target, kickmsg=extinfo), False))
+
+        events.append(
+            ("onKick", dict(kicker=origin, channel=target, kicked=kicked, kickmsg=extinfo), True))
+        return (self.addons + target.addons, events)
+
+        if target in kicked.channels:
+            kicked.channels.remove(target)
+        if kicked in target.users:
+            target.users.remove(kicked)
+        if self.supports.has_key("PREFIX"):
+            for mode in self.supports["PREFIX"][0]:
+                if target.modes.has_key(mode) and kicked in target.modes[mode]:
+                    target.modes[mode].remove(kicked)
+
+    def parsePART(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [
+                    ("onMePart", dict(channel=None, partmsg=None), True),
+                    ("onPart", dict(user=None, channel=None, partmsg=None), True)
+                    ])
+        if origin == self.identity:
+            return (self.addons + target.addons, [
+                    ("onMePart", dict(channel=target, partmsg=extinfo), False),
+                    ("onPart", dict(user=origin, channel=target, partmsg=extinfo), True)
+                    ])
+        else:
+            return (self.addons + target.addons, [("onPart", dict(user=origin, channel=target, partmsg=extinfo), True)])
+
+    def parseQUIT(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [("onQuit", dict(user=None, quitmsg=None), True)])
+
+        # Include addons for channels that both user and bot are in
+        # simultaneously.
+        addons = reduce(
+            lambda x, y: x + y, [channel.addons for channel in origin.channels if self.identity in channel.users], [])
+        return (self.addons + addons, [("onQuit", dict(user=origin, quitmsg=extinfo), True)])
+
+    def parseMODE(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            events = [
+                ("onChanModeSet", dict(
+                    user=None, channel=None, modedelta=None), True),
+                ("onUserModeSet", dict(origin=None, modedelta=None), True)
+            ]
+            for (mode, (setname, unsetname)) in _maskmodeeventnames.items():
+                events.append(
+                    ("on%s" % setname, dict(user=None, channel=None, banmask=None), False))
+                events.append(
+                    ("onMe%s" % setname, dict(user=None, channel=None, banmask=None), False))
+                events.append(
+                    ("on%s" % unsetname, dict(user=None, channel=None, banmask=None), False))
+                events.append(
+                    ("onMe%s" % unsetname, dict(user=None, channel=None, banmask=None), False))
+            for (mode, (setname, unsetname)) in _privmodeeventnames.items():
+                events.append(
+                    ("on%s" % setname, dict(user=None, channel=None, modeuser=None), False))
+                events.append(
+                    ("onMe%s" % setname, dict(user=None, channel=None), False))
+                events.append(
+                    ("on%s" % unsetname, dict(user=None, channel=None, banmask=None), False))
+                events.append(
+                    ("onMe%s" % unsetname, dict(user=None, channel=None), False))
+            return (None, events)
+        if type(target) == Channel:
+            events = []
+            modedelta = []
+            modeparams = params.split()
+            setmodes = modeparams.pop(0)
+            modeset = "+"
+            chanmodes = self.supports.get("CHANMODES", _defaultchanmodes)
+            prefix = self.supports.get("PREFIX", _defaultprefix)
+            for mode in setmodes:
+                if mode in "+-":
+                    modeset = mode
+                else:
+                    if mode in chanmodes[0] + chanmodes[1]:
+                        param = modeparams.pop(0)
+                        modedelta.append(("%s%s" % (modeset, mode), param))
+                        if mode in _maskmodeeventnames.keys():
+                            if modeset == "+":
+                                eventname = _maskmodeeventnames[mode][0]
+                                if mode == "k":
+                                    target.key = param
+                            if modeset == "-":
+                                eventname = _maskmodeeventnames[mode][1]
+                                if mode == "k":
+                                    target.key = None
+                            matchesbot = glob.fnmatch.fnmatch(
+                                "%s!%s@%s".lower() % (self.identity.nick, self.identity.username, self.identity.host), param.lower())
+                            events.append(
+                                ("on%s" % eventname, dict(user=origin, channel=target, banmask=param), False))
+                            if matchesbot:
+                                events.append(
+                                    ("onMe%s" % eventname, dict(user=origin, channel=target, banmask=param), False))
+                    elif mode in chanmodes[2]:
+                        if modeset == "+":
+                            param = modeparams.pop(0)
+                            modedelta.append(("%s%s" % (modeset, mode), param))
+                        else:
+                            modedelta.append(("%s%s" % (modeset, mode), None))
+                    elif mode in chanmodes[3]:
+                        modedelta.append(("%s%s" % (modeset, mode), None))
+                    elif mode in prefix[0]:
+                        modenick = modeparams.pop(0)
+                        modeuser = self.user(modenick)
+                        if mode in _privmodeeventnames.keys():
+                            if modeset == "+":
+                                eventname = _privmodeeventnames[mode][0]
+                            if modeset == "-":
+                                eventname = _privmodeeventnames[mode][1]
+                            events.append(
+                                ("on%s" % eventname, dict(user=origin, channel=target, modeuser=modeuser), False))
+                            if modeuser == self.identity:
+                                events.append(
+                                    ("onMe%s" % eventname, dict(user=origin, channel=target), False))
+                        modedelta.append(("%s%s" % (modeset, mode), modeuser))
+            events.append(
+                ("onChanModeSet", dict(user=origin, channel=target, modedelta=modedelta), True))
+            return (self.addons + target.addons, events)
+        elif target == self.identity:
+            modeparams = (params if params else extinfo).split()
+            setmodes = modeparams.pop(0)
+            modedelta = []
+            modeset = "+"
+            for mode in setmodes:
+                if mode in "+-":
+                    modeset = mode
+                    continue
+                if modeset == "+":
+                    if mode == "s":
+                        if len(modeparams):
+                            snomask = modeparams.pop(0)
+                            snomaskdelta = []
+                            snomodeset = "+"
+                            for snomode in snomask:
+                                if snomode in "+-":
+                                    snomodeset = snomode
+                                    continue
+                                snomaskdelta.append(
+                                    "%s%s" % (snomodeset, snomode))
+                            modedelta.append(("+s", snomaskdelta))
+                        else:
+                            modedelta.append(("+s", []))
+                    else:
+                        modedelta.append(("+%s" % mode, None))
+                if modeset == "-":
+                    modedelta.append(("-%s" % mode, None))
+            return (self.addons, [("onUserModeSet", dict(origin=origin, modedelta=modedelta), True)])
+
+    def parseTOPIC(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [("onTopicSet", dict(user=None, channel=None, topic=None), True)])
+        return (self.addons + target.addons, [("onTopicSet", dict(user=origin, channel=target, topic=extinfo), True)])
+
+    def parseINVITE(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [("onInvite", dict(user=None, channel=None), True)])
+        channel = self.channel(extinfo if extinfo else params)
+        return (self.addons + channel.addons, [("onInvite", dict(user=origin, channel=channel), True)])
+
+    def parsePRIVMSG(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            ctcp = re.findall(_ctcpmatch, extinfo)
+            if ctcp:
+                (ctcptype, ext) = ctcp[0]
+                if type(target) == User:
+                    if ctcptype.upper() == "ACTION":
+                        return (self.addons, [("onSendPrivAction", dict(origin=origin, user=target, action=ext), True)])
+                    return (self.addons, [("onSendCTCP", dict(origin=origin, user=target, ctcptype=ctcptype, params=ext), True)])
+                elif type(target) == Channel:
+                    if ctcptype.upper() == "ACTION":
+                        return (self.addons, [("onSendChanAction", dict(origin=origin, channel=target, targetprefix=targetprefix, action=ext), True)])
+                    return (self.addons, [("onSendChanCTCP", dict(origin=origin, channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext), True)])
+            else:
+                if type(target) == User:
+                    return (self.addons, [("onSendPrivMsg", dict(origin=origin, user=target, msg=extinfo), True)])
+                elif type(target) == Channel:
+                    return (self.addons + target.addons, [("onSendChanMsg", dict(origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
+        if origin == None:
+            return (None, [
+                    ("onPrivMsg", dict(user=None, msg=None), True),
+                    ("onChanMsg", dict(user=None, channel=None, targetprefix=None, msg=None), True),
+                    ("onCTCP", dict(user=None, ctcptype=None, params=None), True),
+                    ("onChanCTCP", dict(user=None, channel=None,
+                     targetprefix=None, ctcptype=None, params=None), True),
+                    ("onPrivAction", dict(user=None, action=None), True),
+                    ("onChanAction", dict(
+                        user=None, channel=None, targetprefix=None, action=None), True),
+                    ("onSendPrivMsg", dict(
+                        origin=None, user=None, msg=None), True),
+                    ("onSendChanMsg", dict(
+                        origin=None, channel=None, targetprefix=None, msg=None), True),
+                    ("onSendCTCP", dict(origin=None, user=None, ctcptype=None, params=None), True),
+                    ("onSendPrivAction", dict(
+                        origin=None, user=None, action=None), True),
+                    ("onSendChanAction", dict(
+                        origin=None, channel=None, targetprefix=None, action=None), True),
+                    ("onSendChanCTCP", dict(origin=None, channel=None,
+                     targetprefix=None, ctcptype=None, params=None), True),
+                    ])
+        ctcp = re.findall(_ctcpmatch, extinfo)
+        if ctcp:
+            (ctcptype, ext) = ctcp[0]
+            if target == self.identity:
+                if ctcptype.upper() == "ACTION":
+                    return (self.addons, [("onPrivAction", dict(user=origin, action=ext), True)])
+                return (self.addons, [("onCTCP", dict(user=origin, ctcptype=ctcptype, params=ext), True)])
+            if type(target) == Channel:
+                if ctcptype.upper() == "ACTION":
+                    return (self.addons, [("onChanAction", dict(user=origin, channel=target, targetprefix=targetprefix, action=ext), True)])
+                return (self.addons, [("onChanCTCP", dict(user=origin, channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext), True)])
+        else:
+            if type(target) == Channel:
+                return (self.addons + target.addons, [("onChanMsg", dict(user=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
+            elif target == self.identity:
+                return (self.addons, [("onPrivMsg", dict(user=origin, msg=extinfo), True)])
+
+    def parseNOTICE(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            ctcp = re.findall(_ctcpmatch, extinfo)
+            if ctcp:
+                (ctcptype, ext) = ctcp[0]
+                return (self.addons, [("onSendCTCPReply", dict(origin=origin, ctcptype=ctcptype, params=ext), True)])
+            else:
+                if type(target) == Channel:
+                    return (self.addons + target.addons, [("onSendChanNotice", dict(origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
+                elif type(target) == User:
+                    return (self.addons, [("onSendPrivNotice", dict(origin=origin, user=target, msg=extinfo), True)])
+        if origin == None:
+            return (None, [
+                    ("onPrivNotice", dict(origin=None, msg=None), True),
+                    ("onChanNotice", dict(
+                        origin=None, channel=None, targetprefix=None, msg=None), True),
+                    ("onCTCPReply", dict(
+                        origin=None, ctcptype=None, params=None), True),
+                    ("onSendPrivNotice", dict(origin=None, msg=None), True),
+                    ("onSendChanNotice", dict(
+                        origin=None, channel=None, targetprefix=None, msg=None), True),
+                    ("onSendCTCPReply", dict(
+                        origin=None, ctcptype=None, params=None), True),
+                    ])
+        ctcp = re.findall(_ctcpmatch, extinfo)
+        # print ctcp
+        if ctcp and target == self.identity:
+            (ctcptype, ext) = ctcp[0]
+            return (self.addons, [("onCTCPReply", dict(origin=origin, ctcptype=ctcptype, params=ext), True)])
+        else:
+            if type(target) == Channel:
+                return (self.addons + target.addons, [("onChanNotice", dict(origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
+            elif target == self.identity:
+                # print "onPrivNotice"
+                return (self.addons, [("onPrivNotice", dict(origin=origin, msg=extinfo), True)])
+
+    def parse367(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Ban list
+        if origin == None:
+            return (None, [("onBanListEntry", dict(origin=None, channel=None, mask=None, setby=None, settime=None), True)])
+        (channame, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onBanListEntry", dict(origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse368(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onBanListEnd", dict(origin=None, channel=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onBanListEnd", dict(origin=origin, channel=channel, endmsg=extinfo), True)])
+
+    def parse346(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Invite list
+        if origin == None:
+            return (None, [("onInviteListEntry", dict(origin=None, channel=None, mask=None, setby=None, settime=None), True)])
+        (channame, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onInviteListEntry", dict(origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse347(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onInviteListEnd", dict(origin=None, channel=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onInviteListEnd", dict(origin=origin, channel=channel, endmsg=extinfo), True)])
+
+    def parse348(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Ban Exception list
+        if origin == None:
+            return (None, [("onBanExceptListEntry", dict(origin=None, channel=None, mask=None, setby=None, settime=None), True)])
+        (channame, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onBanExceptListEntry", dict(origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse349(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onBanExceptListEnd", dict(origin=None, channel=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onBanExceptListEnd", dict(origin=origin, channel=channel, endmsg=extinfo), True)])
+
+    def parse910(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Access List
+        if origin == None:
+            return (None, [("onAccessListEntry", dict(origin=None, channel=None, mask=None, setby=None, settime=None), True)])
+        (channame, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onAccessListEntry", dict(origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse911(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onAccessListEnd", dict(origin=None, channel=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onAccessListEnd", dict(origin=origin, channel=channel, endmsg=extinfo), True)])
+
+    def parse941(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Spam Filter list
+        if origin == None:
+            return (None, [("onSpamfilterListEntry", dict(origin=None, channel=None, mask=None, setby=None, settime=None), True)])
+        (channame, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onSpamfilterListEntry", dict(origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse940(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onSpamfilterListEnd", dict(origin=None, channel=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onSpamfilterListEnd", dict(origin=origin, channel=channel, endmsg=extinfo), True)])
+
+    def parse954(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel exemptchanops list
+        if origin == None:
+            return (None, [("onExemptChanOpsListEntry", dict(origin=None, channel=None, mask=None, setby=None, settime=None), True)])
+        (channame, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onExemptChanOpsListEntry", dict(origin=origin, channel=channel, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse953(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onExemptChanOpsListEnd", dict(origin=None, channel=None, endmsg=None), True)])
+        channel = self.channel(params)
+        return (self.addons + channel.addons, [("onExemptChanOpsListEnd", dict(origin=origin, channel=channel, endmsg=extinfo), True)])
+
+    def parse728(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel quiet list
+        if origin == None:
+            return (None, [("onQuietListEntry", dict(origin=None, channel=None, modechar=None, mask=None, setby=None, settime=None), True)])
+        (channame, modechar, mask, setby, settime) = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onQuietListEntry", dict(origin=origin, channel=channel, modechar=modechar, mask=mask, setby=setby, settime=int(settime)), True)])
+
+    def parse729(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
+        if origin == None:
+            return (None, [("onQuietListEnd", dict(channel=None, endmsg=None), True)])
+        channame, modechar = params.split()
+        channel = self.channel(channame)
+        return (self.addons + channel.addons, [("onQuietListEnd", dict(channel=channel, endmsg=extinfo), True)])
+
+    def eventsupports(self):
+        supports = {}
+        for item in dir(self):
+            if re.match(r"parse(\d{3}|[A-Z]+)", item):
+                parsemethod = getattr(self, item)
+                addons, events = parsemethod()
+                for (event, args, fallback) in events:
+                    supports[event] = tuple(args.keys())
+        supports.update({"onConnect": (),
+                         "onRegistered": (),
+                         "onConnectAttempt": (),
+                         "onConnectFail": ("exc", "excmsg", "tb"),
+                         "onSessionOpen": (),
+                         "onSessionClose": (),
+                         "onDisconnect": ("expected",),
+                         "onOther": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
+                         "onUnhandled": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
+                         "onRecv": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
+                         "onSend": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
+                         })
+        return supports
+
+    # Here are the builtin event handlers.
+    def onWelcome(self, context, origin, msg):
+        self.welcome = msg  # Welcome message
+
+    def onYourHost(self, context, origin, msg):
+        self.hostinfo = msg  # Your Host
+
+    def onServerCreated(self, context, origin, msg):
+        self.servcreated = msg  # Server Created
+
+    def onServInfo(self, context, origin, servinfo):
+        self.servinfo = servinfo  # What is this code?
+
+    def onSupports(self, context, origin, supports, msg):  # Server Supports
+        protos = u" ".join(
+            [proto for proto in self.protoctl if proto in supports.keys()])
+        if protos:
+            self._send(u"PROTOCTL {protos}".format(**vars()))
+        self.supports.update(supports)
+
+    def onSnoMask(self, context, origin, snomask):  # Snomask
+        self.identity.snomask = snomask
+        if "s" not in self.identity.modes:
+            self.identity.snomask = ""
+
+    def onUserModes(self, context, origin, modes):  # User Modes
+        self.identity.modes = modes
+        if "s" not in self.identity.modes:
+            self.identity.snomask = ""
+
+    def onNetStats(self, context, origin, netstats):  # Net Stats
+        self.netstats = netstats
+
+    def onOpCount(self, context, origin, opcount):
+        self.opcount = opcount
+
+    def onChanCount(self, context, origin, chancount):
+        self.chancount = chancount
+
+    def onReturn(self, identity, origin, msg):  # Returned from away status
+        self.identity.away = False
+        self.identity.awaymsg = None
+
+    def onAway(self, identity, origin, msg):  # Entered away status
+        self.identity.away = True
+        self.identity.awaymsg = msg
+
+    def onWhoisStart(self, context, origin, user, nickname, username, host, realname):  # Start of WHOIS data
+        user.nick = nickname
+        user.username = username
+        user.host = host
+
+    def onWhoisAway(self, context, origin, user, nickname, awaymsg):  # Away Message
+        user.away = True
+        user.awaymsg = awaymsg
+
+    def onWhoisServer(self, context, origin, user, nickname, server, servername):  # Server
+        user.server = server
+
+    def onWhoisOp(self, context, origin, user, nickname, msg):  # IRC Op
+        user.ircop = True
+        user.ircopmsg = msg
+
+    def onWhoisTimes(self, context, origin, user, nickname, idletime, signontime, msg):  # Idle and Signon times
+        user.idlesince = int(time.time()) - idletime
+        user.signontime = signontime
+
+    def onWhoisSSL(self, context, origin, user, nickname, msg):  # SSL
+        user.secure = True
+
+    def onWhoisLoggedInAs(self, context, origin, user, nickname, loggedinas, msg):  # Logged in as
+        user.loggedinas = loggedinas
+
+    def onChannelModes(self, context, origin, channel, modedelta):  # Channel Modes
+        chanmodes = self.supports.get("CHANMODES", _defaultchanmodes)
+        for ((modeset, mode), param) in modedelta:
+            if mode in chanmodes[2]:
+                channel.modes[mode] = param
+            elif mode in chanmodes[3]:
+                channel.modes[mode] = True
+
+    def onChanCreated(self, context, origin, channel, created):  # Channel created
+        channel.created = created
+
+    def onTopic(self, context, origin, channel, topic):  # Channel Topic
+        channel.topic = topic
+
+    def onTopicInfo(self, context, origin, channel, topicsetby, topictime):  # Channel Topic info
+        channel.topicsetby = topicsetby
+        channel.topictime = topictime
+
+    def onWhoEntry(self, context, origin, channel, user, channame, username, host, serv, nick, flags, hops, realname):  # WHO reply
+        user.hops = hops
+        user.realname = realname
+        user.username = username
+        user.host = host
+        user.server = serv
+        user.away = "G" in flags
+        user.ircop = "*" in flags
+        if type(channel) == Channel:
+            if user not in channel.users:
+                channel.users.append(user)
+            if channel not in user.channels:
+                user.channels.append(channel)
+            for (mode, prefix) in zip(*self.supports.get("PREFIX", _defaultprefix)):
+                if prefix in flags:
+                    if mode in channel.modes.keys() and user not in channel.modes[mode]:
+                        channel.modes[mode].append(user)
+                    elif mode not in channel.modes.keys():
+                        channel.modes[mode] = [user]
+
+    def onNames(self, context, origin, channel, flag, channame, nameslist):  # NAMES reply
+        for (symbs, nick, username, host) in nameslist:
+            user = self.user(nick)
+            if user.nick != nick:
+                user.nick = nick
+            if username and user.username != username:
+                user.username = username
+            if host and user.host != host:
+                user.host = host
+            with channel.lock:
+                if channel not in user.channels:
+                    user.channels.append(channel)
+                if user not in channel.users:
+                    channel.users.append(user)
+                prefix = self.supports.get("PREFIX", _defaultprefix)
+                for symb in symbs:
+                    mode = prefix[0][prefix[1].index(symb)]
+                    if not channel.modes.has_key(mode):
+                        channel.modes[mode] = [user]
+                    elif user not in channel.modes[mode]:
+                        channel.modes[mode].append(user)
+
+    def onMOTDLine(self, context, origin, motdline):  # MOTD line
+        self.motd.append(motdline)
+
+    def onMOTDStart(self, context, origin, motdgreet):  # Begin MOTD
+        self.motdgreet = motdgreet
+        self.motd = []
+
+    def onMOTDEnd(self, context, origin, motdend):
+        self.motdend = motdend  # End of MOTD
+
+    # elif cmd==386 and "q" in self.supports["PREFIX"][0]: # Channel Owner (Unreal)
+        #(channame,owner)=params.split()
+        # channel=self.channel(channame)
+        #self._event("onRecv", channel.addons, **data)
+        # if channel.name!=channame: channel.name=channame ### Server seems to have changed the idea of the case of the channel name
+        # user=self.user(owner)
+        #if user.nick!=owner: user.nick=owner
+        # if channel.modes.has_key("q"):
+            #if user not in channel.modes["q"]: channel.modes["q"].append(user)
+        # else: channel.modes["q"]=[user]
+
+    # elif cmd==388 and "a" in self.supports["PREFIX"][0]: # Channel Admin (Unreal)
+        #(channame,admin)=params.split()
+        # channel=self.channel(channame)
+        #self._event("onRecv", channel.addons, **data)
+        # if channel.name!=channame: channel.name=channame ### Server seems to have changed the idea of the case of the channel name
+        # user=self.user(admin)
+        #if user.nick!=admin: user.nick=admin
+        # if channel.modes.has_key("a"):
+            #if user not in channel.modes["a"]: channel.modes["a"].append(user)
+        # else: channel.modes["a"]=[user]
+
+    def onNickChange(self, context, user, newnick):
+        for other in self.users:
+            if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
+                collision = other.nick.lower() == newnick.lower()
+            else:
+                collision = other.nick.translate(
+                    _rfc1459casemapping) == newnick.translate(_rfc1459casemapping)
+            if collision:
+                self.users.remove(
+                    other)  # Nick collision, safe to assume this orphaned user is offline, so we shall remove the old instance.
+                for channel in self.channels:
+                    # If for some odd reason, the old user still appears common
+                    # channels, then we will remove the user anyway.
+                    if other in channel.users:
+                        channel.users.remove(other)
+        user.nick = newnick
+
+    def onJoin(self, context, user, channel):
+        if channel not in user.channels:
+            user.channels.append(channel)
+        if user not in channel.users:
+            channel.users.append(user)
+
+    def onMeJoin(self, context, channel):
+        channel._init()
+        with channel._joining:
+            if channel._joinrequested:
+                channel._joinreply = "JOIN"
+                channel._joining.notify()
+        self._send(u"MODE %s" % channel.name)
+        self._send(u"WHO %s" % channel.name)
+        self._send(u"MODE %s :%s" %
+                   (channel.name, self.supports.get("CHANMODES", _defaultchanmodes)[0]))
+
+    def onKick(self, context, kicker, channel, kicked, kickmsg):
+        if channel in kicked.channels:
+            kicked.channels.remove(channel)
+        if kicked in channel.users:
+            channel.users.remove(kicked)
+        prefix = self.supports.get("PREFIX", _defaultprefix)
+        for mode in prefix[0]:
+            if mode in channel.modes.keys() and kicked in channel.modes[mode]:
+                channel.modes[mode].remove(kicked)
+
+    def onPart(self, context, user, channel, partmsg):
+        if channel in user.channels:
+            user.channels.remove(channel)
+        if user in channel.users:
+            channel.users.remove(user)
+        prefix = self.supports.get("PREFIX", _defaultprefix)
+        for mode in prefix[0]:
+            if mode in channel.modes.keys() and user in channel.modes[mode]:
+                channel.modes[mode].remove(user)
+
+    def onMePart(self, context, channel, partmsg):
+        with channel._parting:
+            if channel._partrequested:
+                channel._partreply = "PART"
+                channel._parting.notify()
+
+    def onMeKicked(self, context, kicker, channel, kickmsg):
+        with channel._parting:
+            if channel._partrequested:
+                channel._partreply = "KICK"
+                channel._parting.notify()
+
+    def onQuit(self, context, user, quitmsg):
+        channels = list(user.channels)
+        for channel in channels:
+            with channel.lock:
+                if user in channel.users:
+                    channel.users.remove(user)
+                prefix = self.supports.get("PREFIX", _defaultprefix)
+                for mode in prefix[0]:
+                    if mode in channel.modes.keys() and user in channel.modes[mode]:
+                        channel.modes[mode].remove(user)
+        user._init()
+
+    def onChanModeSet(self, context, user, channel, modedelta):
+        chanmodes = self.supports.get("CHANMODES", _defaultchanmodes)
+        prefix = self.supports.get("PREFIX", _defaultprefix)
+        with channel.lock:
+            for ((modeset, mode), param) in modedelta:
+                if mode in chanmodes[0] + prefix[0]:
+                    if mode not in channel.modes.keys():
+                        channel.modes[mode] = []
+                if mode in chanmodes[0]:
+                    if modeset == "+":
+                        if param.lower() not in [mask.lower() for (mask, setby, settime) in channel.modes[mode]]:
+                            channel.modes[mode].append(
+                                (param, user, int(time.time())))
+                    else:
+                        if mode == "b":  # Inspircd mode is case insentive when unsetting the mode
+                            masks = [mask.lower()
+                                     for (mask, setby, settime) in channel.modes[mode]]
+                            if param.lower() in masks:
+                                index = masks.index(param.lower())
+                                del channel.modes[mode][index]
+                        else:
+                            masks = [
+                                mask for (mask, setby, settime) in channel.modes[mode]]
+                            if param in masks:
+                                index = masks.index(param)
+                                del channel.modes[mode][index]
+                elif mode in chanmodes[1]:
+                    if modeset == "+":
+                        channel.modes[mode] = param
+                    else:
+                        channel.modes[mode] = None
+                elif mode in chanmodes[2]:
+                    if modeset == "+":
+                        channel.modes[mode] = param
+                    else:
+                        channel.modes[mode] = None
+                elif mode in chanmodes[3]:
+                    if modeset == "+":
+                        channel.modes[mode] = True
+                    else:
+                        channel.modes[mode] = False
+                elif mode in prefix[0]:
+                    if modeset == "+":
+                        if param not in channel.modes[mode]:
+                            channel.modes[mode].append(param)
+                    elif param in channel.modes[mode]:
+                        channel.modes[mode].remove(param)
+
+    def onUserModeSet(self, context, origin, modedelta):
+        for ((modeset, mode), param) in modedelta:
+            if modeset == "+":
+                if mode not in self.identity.modes:
+                    self.identity.modes += mode
+                if mode == "s":
+                    for snomodeset, snomode in param:
+                        if snomodeset == "+" and snomode not in self.identity.snomask:
+                            self.identity.snomask += snomode
+                        if snomodeset == "-" and snomode in self.identity.snomask:
+                            self.identity.snomask = self.identity.snomask.replace(
+                                snomode, "")
+            if modeset == "-":
+                if mode in self.identity.modes:
+                    self.identity.modes = self.identity.modes.replace(mode, "")
+                if mode == "s":
+                    self.identity.snomask = ""
+
+    def onTopicSet(self, context, user, channel, topic):
+        with channel.lock:
+            channel.topic = topic
+            channel.topicsetby = user
+            channel.topictime = int(time.time())
+
+    def onCTCP(self, context, user, ctcptype, params):
+        if ctcptype.upper() == "VERSION":
+            user.ctcpreply("VERSION", self.ctcpversion())
+        elif ctcptype.upper() == "TIME":
+            tformat = time.ctime()
+            tz = time.tzname[0]
+            user.ctcpreply("TIME", "%(tformat)s %(tz)s" % vars())
+        elif ctcptype.upper() == "PING":
+            user.ctcpreply("PING", params)
+        elif ctcptype.upper() == "FINGER":
+            user.ctcpreply("FINGER", params)
+
+    def onChanCTCP(self, context, user, channel, targetprefix, ctcptype, params):
+        self.onCTCP(context, user, ctcptype, params)
+
+    def onBanListEntry(self, context, origin, channel, mask, setby, settime):  # Channel Ban list
+        if "b" not in channel.modes.keys():
+            channel.modes["b"] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["b"]]:
+            channel.modes["b"].append((mask, setby, int(settime)))
+
+    def onInviteListEntry(self, context, origin, channel, mask, setby, settime):  # Channel Invite Exception list
+        if "I" not in channel.modes.keys():
+            channel.modes["I"] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["I"]]:
+            channel.modes["I"].append((mask, setby, int(settime)))
+
+    def onBanExceptListEntry(self, context, origin, channel, mask, setby, settime):  # Channel Invite Exception list
+        if "e" not in channel.modes.keys():
+            channel.modes["e"] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["e"]]:
+            channel.modes["e"].append((mask, setby, int(settime)))
+
+    def onAccessListEntry(self, context, origin, channel, mask, setby, settime):  # Channel Invite Exception list
+        if "w" not in channel.modes.keys():
+            channel.modes["w"] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["w"]]:
+            channel.modes["w"].append((mask, setby, int(settime)))
+
+    def onSpamfilterListEntry(self, context, origin, channel, mask, setby, settime):  # Channel Invite Exception list
+        if "g" not in channel.modes.keys():
+            channel.modes["g"] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["g"]]:
+            channel.modes["g"].append((mask, setby, int(settime)))
+
+    def onExemptChanOpsListEntry(self, context, origin, channel, mask, setby, settime):  # Channel Invite Exception list
+        if "X" not in channel.modes.keys():
+            channel.modes["X"] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes["X"]]:
+            channel.modes["X"].append((mask, setby, int(settime)))
+
+    def onQuietListEntry(self, context, origin, channel, modechar, mask, setby, settime):  # Channel quiet list (Freenode)
+        if modechar not in channel.modes.keys():
+            channel.modes[modechar] = []
+        if mask.lower() not in [m.lower() for (m, s, t) in channel.modes[modechar]]:
+            channel.modes[modechar].append((mask, setby, int(settime)))
+
+    def onOther(self, context, line, origin, cmd, target, targetprefix, params, extinfo):
+        if cmd in (384, 403, 405, 471, 473, 474, 475, 476, 520, 477, 489, 495):  # Channel Join denied
+            try:
+                channel = self.channel(params)
+            except InvalidName:
+                pass
+            else:
+                with channel._joining:
+                    if channel._joinrequested:
+                        channel._joinreply = (cmd, extinfo)
+                        channel._joining.notify()
+
+        elif cmd == 470:  # Channel Join denied due to redirect
+            channelname, redirect = params.split()
+            try:
+                channel = self.channel(channelname)
+            except InvalidName:
+                pass
+            else:
+                with channel._joining:
+                    if channel._joinrequested:
+                        channel._joinreply = (
+                            cmd, "%s (%s)" % (extinfo, redirect))
+                        channel._joining.notify()
+
+    # elif cmd in (495, 384, 385, 386, 468, 470, 366, 315, 482, 484, 953, 368, 482, 349, 940, 911, 489, 490, 492, 520, 530): # Channels which appear in params
+        # for param in params.split():
+            # if len(param) and param[0] in self.supports["CHANTYPES"]:
+                # channel=self.channel(param)
+                #self._event("onRecv", channel.addons, **data)
+
+    def _trynick(self):
+        (q, s) = divmod(self.trynick, len(self.nick)
+                        if type(self.nick) in (list, tuple) else 1)
+        nick = self.nick[s] if type(self.nick) in (list, tuple) else self.nick
+        if q > 0:
+            nick = "%s%d" % (nick, q)
+        self._send(u"NICK %s" % nick)
+        self.trynick += 1
+
     def _send(self, line, origin=None, T=None):
+        with self.lock:
+            if not self.connected:
+                raise NotConnected
         if "\r" in line or "\n" in line:
             raise InvalidCharacter
+        if type(line) == str:
+            line = autodecode(line)
         cmd = line.split(" ")[0].upper()
 
         if T == None:
@@ -1645,47 +2177,24 @@ class Connection(object):
                             extinfo = "********"
                             line = "%s %s :%s" % (cmd, target, extinfo)
 
-                chanmatch = re.findall(
-                    _targchanmatch % (re.escape(self.supports.get("PREFIX", ("ohv", "@%+"))[1]), re.escape(self.supports.get("CHANTYPES", "#"))), target)
-                if chanmatch:
-                    targetprefix, channame = chanmatch[0]
-                    target = self.channel(channame)
-                    if target.name != channame:
-                        # Target channel name has changed
-                        target.name = channame
-                elif re.match(_nickmatch, target) and cmd != "NICK":
-                    targetprefix = ""
-                    target = self.user(target)
-
-                ctcp = re.findall(_ctcpmatch, extinfo)
-                if ctcp:
-                    (ctcptype, ext) = ctcp[0]
-                    if ctcptype.upper() == "ACTION":
-                        if type(target) == Channel:
-                            self._event(
-                                "onSendChanAction", self.addons +
-                                target.addons,
-                                origin=origin, channel=target, targetprefix=targetprefix, action=ext)
-                        elif type(target) == User:
-                            self._event(
-                                "onSendPrivAction", self.addons, origin=origin, user=target, action=ext)
-                    else:
-                        if type(target) == Channel:
-                            self._event(
-                                "onSendChanCTCP", self.addons + target.addons, origin=origin,
-                                channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext)
-                        elif type(target) == User:
-                            self._event(
-                                "onSendPrivCTCP", self.addons, origin=origin, user=target, ctcptype=ctcptype, params=ext)
-                else:
-                    if type(target) == Channel:
-                        self._event(
-                            "onSendChanMsg", self.addons + target.addons, origin=origin,
-                            channel=target, targetprefix=targetprefix, msg=extinfo)
-                    elif type(target) == User:
-                        self._event(
-                            "onSendPrivMsg", self.addons, origin=origin, user=target, msg=extinfo)
-
+                #ctcp=re.findall(_ctcpmatch, extinfo)
+                # if ctcp:
+                    #(ctcptype,ext)=ctcp[0]
+                    # if ctcptype.upper()=="ACTION":
+                        # if type(target)==Channel:
+                            #self._event("onSendChanAction", self.addons+target.addons, origin=origin, channel=target, targetprefix=targetprefix, action=ext)
+                        # elif type(target)==User:
+                            #self._event("onSendPrivAction", self.addons, origin=origin, user=target, action=ext)
+                    # else:
+                        # if type(target)==Channel:
+                            #self._event("onSendChanCTCP", self.addons+target.addons, origin=origin, channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext)
+                        # elif type(target)==User:
+                            #self._event("onSendPrivCTCP", self.addons, origin=origin, user=target, ctcptype=ctcptype, params=ext)
+                # else:
+                    # if type(target)==Channel:
+                        #self._event("onSendChanMsg", self.addons+target.addons, origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo)
+                    # elif type(target)==User:
+                        #self._event("onSendPrivMsg", self.addons, origin=origin, user=target, msg=extinfo)
                 # elif target.upper()=="CHANSERV":
                     #msg=extinfo.split(" ")
                     # if msg[0].upper() in ("IDENTIFY", "REGISTER") and len(msg)>2:
@@ -1723,9 +2232,67 @@ class Connection(object):
             elif cmd.upper() == "IDENTIFY":
                 target = "********"
                 line = "%s %s" % (cmd, target)
+
+            prefix = self.supports.get("PREFIX", _defaultprefix)
+            chantypes = self.supports.get("CHANTYPES", _defaultchantypes)
+            chanmatch = re.findall(_targchanmatch %
+                                   (re.escape(prefix[1]), re.escape(chantypes)), target)
+
+            # Check to see if target matches a channel (optionally with prefix)
+            if chanmatch:
+                targetprefix, channame = chanmatch[0]
+                target = self.channel(channame)
+                if target.name != channame:
+                    # Target channel name has changed
+                    target.name = channame
+            # Check to see if target matches a valid nickname. Do NOT convert
+            # target to User instance if cmd is NICK.
+            elif re.match(_nickmatch, target) and cmd != "NICK":
+                targetprefix = ""
+                target = self.user(target)
+
+            # Otherwise, target is just left as a string
+            else:
+                targetprefix = ""
+
+            parsename = ("parse%03d" if type(cmd) == int else "parse%s") % cmd
+            if hasattr(self, parsename):
+                parsemethod = getattr(self, parsename)
+                if callable(parsemethod):
+                    try:
+                        addons, events = parsemethod(
+                            origin, target, targetprefix, params, extinfo, outgoing=True)
+                    except:
+                        exc, excmsg, tb = sys.exc_info()
+
+                        # Print to log AND stderr
+                        tblines = [
+                            u"!!! There was an error in parsing the following line:", u"!!! %s" % line]
+                        for tbline in traceback.format_exc().split("\n"):
+                            tblines.append(u"!!! %s" % autodecode(tbline))
+                        self.logwrite(*tblines)
+                        print >>sys.stderr, u"There was an error in parsing the following line:"
+                        print >>sys.stderr, u"%s" % line
+                        print >>sys.stderr, traceback.format_exc()
+                        return
+            else:
+                addons = self.addons
+                if type(cmd) == unicode:
+                    events = [(
+                        "onSend%s" % cmd.upper(), dict(line=line, origin=origin if origin else self,
+                                                       target=target, targetprefix=targetprefix, params=params, extinfo=extinfo), True)]
+                else:
+                    events = []
+            if addons == None:
+                addons = []
+
+            if cmd not in ("PING", "PONG") or not self.quietpingpong:  # Supress pings and pongs if self.quietpingpong is set to True
+                self._event(
+                    addons + [self], [("onSend", dict(origin=origin if origin else self, line=line, cmd=cmd, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo), False)], line)
+                self._event(addons + [self], events, line)
+
             if not (cmd in ("PING", "PONG") and self.quietpingpong):
-                self._event("onSend", self.addons, origin=origin, line=line,
-                            cmd=cmd, target=target, params=params, extinfo=extinfo)
+                #self._event(self.addons, [("onSend" , dict(origin=origin, line=line, cmd=cmd, target=target, params=params, extinfo=extinfo), False)])
                 self.logwrite(">>> %s" % line)
             self._connection.send("%s\n" % origline.encode('utf8'))
 
@@ -1766,9 +2333,9 @@ class Connection(object):
                     exc, excmsg, tb = sys.exc_info()
                     with self.lock:
                         self.logwrite(
-                            "*** Connection to %(server)s:%(port)s failed: %(excmsg)s." % vars())
-                        self._event("onConnectFail", self.addons + reduce(
-                            lambda x, y: x + y, [chan.addons for chan in self.channels], []), exc=exc, excmsg=excmsg, tb=tb)
+                            u"*** Connection to {self:uri} failed: {excmsg}.".format(**vars()))
+                        self._event(self.getalladdons(), [
+                                    ("onConnectFail", dict(exc=exc, excmsg=excmsg, tb=tb), False)])
                     with self._sendline:
                         self._outgoing.clear()
                     try:
@@ -1782,9 +2349,11 @@ class Connection(object):
         except:
             tb = traceback.format_exc()
             self._quitexpected = True
-            self.logwrite(*["!!! FATAL Exception"] + [
-                          "!!! %s" % line for line in tb.split("\n")])
-            print >>sys.stderr, "FATAL Exception"
+            tblines = [u"!!! FATAL Exception"]
+            for line in traceback.format_exc().split("\n"):
+                tblines.append(u"!!! %s" % autodecode(line))
+            self.logwrite(*tblines)
+            print >>sys.stderr, "FATAL Exception in {self}".format(**vars())
             print >>sys.stderr, tb
             with self._sendline:
                 try:
@@ -1809,41 +2378,39 @@ class Connection(object):
 
     def __repr__(self):
         server = self.server
-        if self.ipv6 and ":" in server:
+        if self.ipver == socket.AF_INET6 and ":" in server:
             server = "[%s]" % server
-        port = self.port
         if self.identity:
-            nick = self.identity.nick
-            user = self.identity.username if self.identity.username else "*"
-            host = self.identity.host if self.identity.host else "*"
+            return "<IRC Context: {self.identity:full} on {self:uri}>".format(**locals())
         else:
-            nick = "*"
-            user = "*"
-            host = "*"
-        if self.ssl and self.ipv6:
-            protocol = "ircs6"
-        elif self.ssl:
-            protocol = "ircs"
-        elif self.ipv6:
-            protocol = "irc6"
-        else:
-            protocol = "irc"
-        return "<IRC Context: %(nick)s!%(user)s@%(host)s on %(protocol)s://%(server)s:%(port)s>" % locals()
-        # else: return "<IRC Context: irc%(ssl)s://%(server)s:%(port)s>" %
-        # locals()
+            return "<IRC Context: *!*@* on {self:uri}>".format(**locals())
+
+    def __format__(self, fmt):
+        port = self.port if self.port is not None else 6697 if self.secure else 6667
+        if fmt == "uri":
+            ssl = "s" if self.secure else ""
+            proto = "6" if self.ipver == socket.AF_INET6 else ""
+            if self.ipver == socket.AF_INET6 and ":" in self.server:
+                return "irc{ssl}{proto}://[{self.server}]:{port}".format(**locals())
+            else:
+                return "irc{ssl}{proto}://{self.server}:{port}".format(**locals())
 
     def oper(self, name, passwd, origin=None):
-        self._send(u"OPER %s %s" %
-                   (re.findall("^([^\r\n\\s]*)", name)[0], re.findall("^([^\r\n\\s]*)", passwd)[0]), origin=origin)
+        if re.match(".*[\n\r\\s]", name) or re.match(".*[\n\r\\s]", passwd):
+            raise InvalidCharacter
+        self._send(u"OPER {name} {passwd}".format(**vars()), origin=origin)
 
     def list(self, params="", origin=None):
-        if len(re.findall("^([^\r\n\\s]*)", params)[0]):
-            self._send(u"LIST %s" %
-                       (re.findall("^([^\r\n\\s]*)", params)[0]), origin=origin)
+        if re.match(".*[\n\r\\s]", params):
+            raise InvalidCharacter
+        if params:
+            self._send(u"LIST {params}".format(**vars()), origin=origin)
         else:
             self._send(u"LIST", origin=origin)
 
     def getmotd(self, target="", origin=None):
+        if re.match(".*[\n\r\\s]", name) or re.match(".*[\n\r\\s]", passwd):
+            raise InvalidCharacter
         if len(re.findall("^([^\r\n\\s]*)", target)[0]):
             self._send(u"MOTD %s" %
                        (re.findall("^([^\r\n\\s]*)", target)[0]), origin=origin)
@@ -1864,39 +2431,58 @@ class Connection(object):
         else:
             self._send(u"STATS %s" % query, origin=origin)
 
-    def quit(self, msg="", origin=None):
-        if len(re.findall("^([^\r\n]*)", msg)[0]):
-            self._send(u"QUIT :%s" %
-                       re.findall("^([^\r\n]*)", msg)[0], origin=origin)
+    # Quit IRC session gracefully
+    def quit(self, msg="", origin=None, blocking=False):
+        if "\r" in msg or "\n" in msg:
+            raise InvalidCharacter
+        if msg:
+            self._send(u"QUIT :%s" % msg, origin=origin)
         else:
             self._send(u"QUIT", origin=origin)
+        if blocking:
+            with self._disconnecting:
+                while self.connected:
+                    self._disconnecting.wait()
+                self._recvhandlerthread.join()
+                self._sendhandlerthread.join()
+
+    # Force disconnect -- Not even sending QUIT to server.
+    def disconnect(self):
+        with self.lock:
+            self._quitexpected = True
+            self._connection.shutdown(2)
 
     def ctcpversion(self):
         reply = []
-        # Prepare reply for addon
+        # Prepare reply for this module
         reply.append(
-            "%(__name__)s %(__version__)s, %(__author__)s" % vars(self))
+            u"{self.__name__} {self.__version__}, {self.__author__}".format(**vars()))
 
         # Prepare reply for Python and OS versions
         pyver = sys.version.split("\n")
         pyver[0] = "Python " + pyver[0]
         reply.extend(pyver)
         reply.extend(platform.platform().split("\n"))
-        # Prepare reply for extension addons
+
+        # Prepare reply for each addons
         for addon in self.addons:
             try:
-                r = "%(__name__)s %(__version__)s" % vars(addon)
-                if "__extinfo__" in vars(addon):
-                    r += ", %(__extinfo__)s" % vars()
-                reply.append(r)
+                if hasattr(addon, "__extinfo__"):
+                    reply.append(
+                        u"{addon.__name__} {addon.__version__}, {addon.__extinfo__}".format(**vars()))
+                else:
+                    reply.append(
+                        u"{addon.__name__} {addon.__version__}".format(**vars()))
             except:
                 pass
-        return reduce(lambda x, y: "%s; %s" % (x, y), reply)
+        return u"; ".join(reply)
 
     def raw(self, line, origin=None):
         self._send(line, origin=origin)
 
     def user(self, nick, init=False):
+        if type(nick) == str:
+            nick = autodecode(nick)
         if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
             users = [
                 user for user in self.users if user.nick.lower() == nick.lower()]
@@ -1915,6 +2501,8 @@ class Connection(object):
             return user
 
     def channel(self, name, init=False):
+        if type(name) == str:
+            name = autodecode(name)
         if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
             channels = [
                 chan for chan in self.channels if chan.name.lower() == name.lower()]
@@ -1933,7 +2521,7 @@ class Connection(object):
             return chan
 
     def __getitem__(self, item):
-        chantypes = self.supports.get("CHANTYPES", "&#+!")
+        chantypes = self.supports.get("CHANTYPES", _defaultchantypes)
         if re.match(_chanmatch % re.escape(chantypes), item):
             return self.channel(item)
         elif re.match(_usermatch, item):
@@ -1941,34 +2529,94 @@ class Connection(object):
         else:
             raise TypeError, "String argument does not match valid channel name or nick name."
 
+    def fmtsupports(self):
+        supports = [
+            "CHANMODES=%s" % (",".join(value)) if name == "CHANMODES" else "PREFIX=(%s)%s" %
+            value if name == "PREFIX" else "%s=%s" % (name, value) if value else name for name, value in self.supports.items()]
+        supports.sort()
+        supports = " ".join(supports)
+        lines = []
+        while len(supports) > 196:
+            index = supports.rfind(" ", 0, 196)
+            slice = supports[:index]
+            lines.append(
+                u":{self.serv} 005 {self.identity.nick} {slice} :are supported by this server".format(**vars()))
+            supports = supports[index + 1:]
+        if supports:
+            lines.append(
+                u":{self.serv} 005 {self.identity.nick} {supports} :are supported by this server".format(**vars()))
+        return lines
+
+    def fmtgreeting(self):
+        # Prepare greeting (Responses 001 through 004)
+        lines = []
+        if self.welcome:
+            lines.append(
+                u":{self.serv} 001 {self.identity.nick} :{self.welcome}".format(**vars()))
+        if self.hostinfo:
+            lines.append(
+                u":{self.serv} 002 {self.identity.nick} :{self.hostinfo}".format(**vars()))
+        if self.servcreated:
+            lines.append(
+                u":{self.serv} 003 {self.identity.nick} :{self.servcreated}".format(**vars()))
+        if self.servinfo:
+            lines.append(
+                u":{self.serv} 004 {self.identity.nick} {self.servinfo}".format(**vars()))
+        return lines
+
+    def fmtusermodes(self):
+        # Prepars 221 response
+        return u":{self.serv} 221 {self.identity.nick} +{self.identity.modes}".format(**vars())
+
+    def fmtsnomasks(self):
+        # Prepare 008 response
+        return u":{self.serv} 008 {self.identity.nick} +{self.identity.snomask} :Server notice mask".format(**vars())
+
+    def fmtmotd(self):
+        if self.motdgreet and self.motd and self.motdend:
+            lines = []
+            lines.append(
+                u":{self.serv} 375 {self.identity.nick} :{self.motdgreet}".format(**vars()))
+            for motdline in self.motd:
+                lines.append(
+                    u":{self.serv} 372 {self.identity.nick} :{motdline}".format(**vars()))
+            lines.append(
+                u":{self.serv} 376 {self.identity.nick} :{self.motdend}".format(**vars()))
+            return lines
+        else:
+            return [u":{self.serv} 422 {self.identity.nick} :MOTD File is missing".format(**vars())]
+
 
 class Channel(object):
 
     def __init__(self, name, context, key=None):
-        chantypes = context.supports.get("CHANTYPES", "&#+!")
+        chantypes = context.supports.get("CHANTYPES", _defaultchantypes)
         if not re.match(_chanmatch % re.escape(chantypes), name):
             raise InvalidName, repr(name)
         self.name = name
         self.context = context
         self.key = key
+        self.lock = Lock()
         self._init()
+        self._joining = Condition(self.lock)
+        self._parting = Condition(self.lock)
+        self._joinrequested = False
+        self._joinreply = None
+        self._partrequested = False
+        self._partreply = None
 
     def _init(self):
+        for user in self.context.users:
+            if self in user.channels:
+                user.channels.remove(self)
         self.addons = []
         self.topic = ""
         self.topicsetby = ""
-        self.topictime = ()
+        self.topictime = None
         self.topicmod = ""
         self.modes = {}
         self.users = UserList(context=self.context)
         self.created = None
-        self.lock = Lock()
-        self._joinrequested = False
-        self._joinreply = None
-        self._joining = Condition(self.lock)
-        self._partrequested = False
-        self._partreply = None
-        self._parting = Condition(self.lock)
 
     def msg(self, msg, target="", origin=None):
         if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
@@ -1977,11 +2625,91 @@ class Channel(object):
             self.context._send(u"PRIVMSG %s%s :%s" %
                                (target, self.name, line), origin=origin)
 
-    def who(self, origin=None):
+    def who(self, origin=None, blocking=False):
+        # Send WHO request to server
         self.context._send(u"WHO %s" % (self.name), origin=origin)
+
+    def fmtwho(self):
+        # Create WHO reply from current data. TODO
+        pass
 
     def names(self, origin=None):
         self.context._send(u"NAMES %s" % (self.name), origin=origin)
+
+    def fmtnames(self, sort=None, uhnames=False, namesx=False):
+        # Create NAMES reply from current data.
+        secret = "s" in self.modes.keys() and self.modes["s"]
+        private = "p" in self.modes.keys() and self.modes["p"]
+        flag = "@" if secret else ("*" if private else "=")
+
+        modes, symbols = self.context.supports.get("PREFIX", ("ohv", "@%+"))
+        users = list(self.users)
+        if sort == "mode":
+            users.sort(key=lambda user: ([user not in self.modes.get(mode, [])
+                       for mode, char in zip(*self.context.supports.get("PREFIX", ("ohv", "@%+")))], user.nick.lower()))
+        elif sort == "nick":
+            users.sort(key=lambda user: user.nick.lower())
+        if uhnames:
+            template = u"{prefixes}{user:full}"
+        else:
+            template = u"{prefixes}{user}"
+
+        nameslist = []
+        for user in users:
+            prefixes = u"".join(
+                [prefix if mode in self.modes.keys() and user in self.modes[mode] else "" for prefix, mode in zip(symbols, modes)])
+            if not namesx:
+                prefixes = prefixes[:1]
+            nameslist.append(template.format(**vars()))
+        names = " ".join(nameslist)
+
+        lines = []
+        while len(names) > 196:
+            index = names.rfind(" ", 0, 196)
+            slice = names[:index]
+            lines.append(
+                u":{self.context.identity.server} 353 {self.context.identity.nick} {flag} {self.name} :{slice}".format(**vars()))
+            names = names[index + 1:]
+        if len(names):
+            lines.append(
+                u":{self.context.identity.server} 353 {self.context.identity.nick} {flag} {self.name} :{names}".format(**vars()))
+
+        lines.append(
+            u":{self.context.identity.server} 366 {self.context.identity.nick} {self.name} :End of /NAMES list.".format(**vars()))
+        return lines
+
+    def fmttopic(self):
+        # Prepares 332 and 333 responses
+        if self.topic and self.topictime:
+            response332 = u":{self.context.identity.server} 332 {self.context.identity.nick} {self.name} :{self.topic}".format(
+                **vars())
+            if type(self.topicsetby) == User:
+                response333 = u":{self.context.identity.server} 333 {self.context.identity.nick} {self.name} {self.topicsetby.nick} {self.topictime}".format(
+                    **vars())
+            else:
+                response333 = u":{self.context.identity.server} 333 {self.context.identity.nick} {self.name} {self.topicsetby} {self.topictime}".format(
+                    **vars())
+            return [response332, response333]
+        else:
+            return [u":{self.context.identity.server} 331 {self.context.identity.nick} {self.name} :No topic is set".format(**vars())]
+
+    def fmtchancreated(self):
+        # Prepares 329 responses
+        return u":{self.context.identity.server} 329 {self.context.identity.nick} {self.name} {self.created}".format(**vars())
+
+    def fmtmodes(self):
+        items = self.modes.items()
+        chanmodes = self.context.supports.get("CHANMODES", _defaultchanmodes)
+        modes = "".join(
+            [mode for (mode, val) in items if mode not in chanmodes[0] + self.context.supports["PREFIX"][0] and val])
+        params = " ".join(
+            [val for (mode, val) in items if mode in chanmodes[1] + chanmodes[2] and val])
+        if modes and params:
+            return u":{self.context.identity.server} 324 {self.context.identity.nick} {self.name} +{modes} {params}".format(**vars())
+        elif modes:
+            return u":{self.context.identity.server} 324 {self.context.identity.nick} {self.name} +{modes}".format(**vars())
+        else:
+            return None
 
     def notice(self, msg, target="", origin=None):
         if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
@@ -2039,7 +2767,7 @@ class Channel(object):
                         t = time.time()
                         if not self.context.connected:
                             raise NotConnected
-                        elif self._partreply == "PART":
+                        elif self._partreply in ("PART", "KICK"):
                             return
                         elif type(self._partreply) == tuple and len(self._partreply) == 2:
                             cmd, extinfo = self._partreply
@@ -2063,6 +2791,8 @@ class Channel(object):
             if self.context.identity in self.users:
                 # Bot is already on the channel
                 raise AlreadyJoined
+            if not self.context.connected:
+                raise NotConnected
         with self._joining:
             try:
                 if self._joinrequested:
@@ -2113,10 +2843,16 @@ class Channel(object):
                                (self.name, nickname), origin=origin)
 
     def __repr__(self):
-        return (u"<Channel: %s@%s/%d>" % (self.name, self.context.server, self.context.port)).encode("utf8")
+        return u"<Channel: {self.name} on {self.context:uri}>".format(**vars())
 
     def __contains__(self, item):
         return item in self.users
+
+    def __format__(self, fmt):
+        return self.name
+
+    def json(self):
+        return self.name
 
 
 class User(object):
@@ -2140,11 +2876,17 @@ class User(object):
         self.ircopmsg = ""
         self.idlesince = None
         self.signontime = None
-        self.ssl = None
+        self.secure = None
         self.away = None
 
     def __repr__(self):
         return (u"<User: %(nick)s!%(username)s@%(host)s>" % vars(self)).encode("utf8")
+
+    def __format__(self, fmt):
+        if fmt == "full":
+            return u"{self.nick}!{self.username}@{self.host}".format(**locals())
+        else:
+            return self.nick
 
     def msg(self, msg, origin=None):
         for line in re.findall("([^\r\n]+)", msg):
@@ -2173,11 +2915,54 @@ class User(object):
     def me(self, msg="", origin=None):
         self.ctcp("ACTION", msg, origin=origin)
 
+    def json(self):
+        return self.nick
+
 
 class Config(object):
 
-    def __init__(self, **kwargs):
+    def __init__(self, addon, **kwargs):
+        self.addon = addon
         self.__dict__.update(kwargs)
+
+    def json(self):
+        if "onAddonAdd" in dir(self.addon) and type(self.addon.onAddonAdd) == new.instancemethod:
+            conf = OrderedDict(addon=self.addon)
+            try:
+                arginspect = inspect.getargspec(self.addon.onAddonAdd)
+            except:
+                raise TypeError(
+                    repr(self.addon.onAddonAdd) + " is not JSON serializable")
+
+            if arginspect.defaults:
+                requiredargs = arginspect.args[
+                    2:len(arginspect.args) - len(arginspect.defaults)]
+                argswithdefaults = arginspect.args[
+                    len(arginspect.args) - len(arginspect.defaults):]
+                defaultvalues = arginspect.defaults
+            else:
+                requiredargs = arginspect.args[2:]
+                argswithdefaults = []
+                defaultvalues = []
+
+            for key in requiredargs:
+                try:
+                    conf[key] = getattr(self, key)
+                except AttributeError:
+                    print key
+                    raise TypeError(
+                        repr(self) + " is not JSON serializable (Cannot recover required argument '%s')" % key)
+
+            for key, default in zip(argswithdefaults, defaultvalues):
+                try:
+                    value = getattr(self, key)
+                    if value != default:
+                        conf[key] = getattr(self, key)
+                except AttributeError:
+                    pass
+            return conf
+        else:
+            return self.addon
 
 
 class ChanList(list):
@@ -2336,3 +3121,20 @@ class UserList(list):
 
     def __str__(self):
         return ",".join([user.nick for user in self])
+
+
+class Server(object):
+
+    def __init__(self, name, context):
+        self.name = name
+        self.context = context
+        self.lock = Lock()
+        self._init()
+
+    def _init(self):
+        self.stats = {}
+        self.users = UserList(context=self.context)
+        self.created = None
+        self.motdgreet = None
+        self.motd = []
+        self.motdend = None

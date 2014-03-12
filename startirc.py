@@ -54,14 +54,14 @@ signal.signal(signal.SIGTERM, sigterm)
 logroot = os.path.join(os.environ["HOME"], "IRC")
 
 InsomniaIRC = networks["InsomniaIRC"] = irc.Connection(
-    server="perseus.insomniairc.net", ipv6=False, ssl=True, log=open("/dev/null", "w"))
+    server="irc.insomniairc.net", nick="pyIRC", secure=True)
 
 ax = autoexec.Autoexec()
 log = logger.Logger(logroot)
 
 ### Be sure to generate your own cert.pem and key.pem files!
 BNC = bouncer.Bouncer(
-    "", 16698, ssl=True, certfile="cert.pem", keyfile="key.pem", autoaway="I'm off to see the wizard!")
+    "", 16698, secure=True, certfile="cert.pem", keyfile="key.pem", autoaway="I'm off to see the wizard!")
 
 for (label, IRC) in networks.items():
     IRC.addAddon(log, label=label)

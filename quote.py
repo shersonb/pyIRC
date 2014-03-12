@@ -44,7 +44,7 @@ class quote(object):
                 else:
                     channel.msg("%s: What am I removing?" % user.nick)
             elif cmd == "--flush":
-                with codecs.open(self.quotefile, "w", encoding=encoding) as f:
+                with codecs.open(self.quotefile, "w", encoding=self.encoding) as f:
                     for line in self.quotes:
                         print >>f, line
             else:
