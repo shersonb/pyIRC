@@ -1260,7 +1260,7 @@ class Connection(object):
         for mode in setmodes:
             if mode == "+":
                 continue
-            elif mode in [2]:
+            elif mode in chanmodes[2]:
                 param = modeparams.pop(0)
                 modedelta.append(("+%s" % mode, param))
             elif mode in chanmodes[3]:
@@ -2440,6 +2440,20 @@ class Connection(object):
                     if len(self.throttledata) >= 5:
                         self.throttled = True
                         T = self.throttledata[-1] + 1
+                else:
+                    if len(self.throttledata) == 0 or self.throttledata[-1] < T - 2:
+                        self.throttled = False
+                    else:
+                        T = max(T, self.throttledata[-1] + 1)
+                self.throttledata.append(T)
+            elif cmd in ("WHO", "MODE"):
+                # Might as well throttle WHOs and MODEs too.
+                while len(self.throttledata) and self.throttledata[0] < T - 4:
+                    del self.throttledata[0]
+                if not self.throttled:
+                    if len(self.throttledata) >= 5:
+                        self.throttled = True
+                        T = self.throttledata[-1] + 0.125
                 else:
                     if len(self.throttledata) == 0 or self.throttledata[-1] < T - 2:
                         self.throttled = False
