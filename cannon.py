@@ -9,12 +9,12 @@ class Cannon(object):
     def __init__(self):
         self.firecount = {}
 
-    def onChanMsg(self, IRC, user, channel, targetprefix, msg):
+    def onChanMsg(self, context, user, channel, targetprefix, msg):
         matches = re.findall("^!fire\\s+(.*)$", msg)
         if matches:
             nickname = matches[0]
             if any([nickname.lower() == usr.nick.lower() for usr in channel.users]):
-                vic = IRC.user(nickname)
+                vic = context.user(nickname)
                 if vic in self.firecount.keys():
                     count = self.firecount[vic] + 1
                 else:
@@ -37,5 +37,5 @@ class Cannon(object):
                     "%s: I cannot fire %s out of a cannon, as he or she is not here." %
                     (user.nick, nickname))
 
-    def onSendChanMsg(self, IRC, origin, channel, targetprefix, msg):
-        self.onChanMsg(IRC, IRC.identity, channel, targetprefix, msg)
+    def onSendChanMsg(self, context, origin, channel, targetprefix, msg):
+        self.onChanMsg(context, context.identity, channel, targetprefix, msg)

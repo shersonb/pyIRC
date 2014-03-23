@@ -19,15 +19,14 @@ class Autoexec(object):
         self._rejoinchannels = {}
             # Saved channels for when a connection is lost
 
-    def onAddonAdd(self, context, label, onconnect=None, onregister=None, autojoin=None, usermodes=None, nsautojoin=None, nsmatch=None, wallet=None, opername=None, opermodes=None, snomasks=None, operexec=None, operjoin=None, autorejoin=True):
+    def onAddonAdd(self, context, label, onconnect=[], onregister=[], autojoin=[], usermodes=None, nsautojoin=[], nsmatch=None, wallet=None, opername=None, opermodes=None, snomasks=None, operexec=None, operjoin=[], autorejoin=True):
         labels = [v.label for v in self.networks.values()]
         if label in labels:
             raise BaseException, "Label already exists"
         if context in self.networks.keys():
             raise BaseException, "Network already exists"
         self.networks[context] = irc.Config(
-            self, label=label, onconnect=onconnect, onregister=onregister, autojoin=irc.ChanList(
-                autojoin, context=context),
+            self, label=label, onconnect=list(onconnect), onregister=list(onregister), autojoin=irc.ChanList(autojoin, context=context),
             usermodes=usermodes, nsautojoin=irc.ChanList(nsautojoin, context=context), nsmatch=nsmatch, wallet=wallet,
             opername=opername, opermodes=opermodes, snomasks=snomasks, operexec=operexec, operjoin=irc.ChanList(operjoin, context=context), autorejoin=autorejoin)
         self._rejoinchannels[context] = None
@@ -35,7 +34,7 @@ class Autoexec(object):
 
     def onDisconnect(self, context, expected):
         conf = self.networks[context]
-        if conf.autorejoin and not expected and context.identity:
+        if conf.autorejoin and not expected and context.identity and context.identity.channels:
             self._rejoinchannels[context] = irc.ChanList(
                 context.identity.channels, context=context)  # Store a *copy* of the list of channels
 

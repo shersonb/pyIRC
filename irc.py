@@ -19,6 +19,9 @@ import inspect
 import warnings
 import random
 
+__all__ = ["Connection", "Channel", "ChanList",
+           "User", "UserList", "Config", "timestamp"]
+
 
 def autodecode(s):
     try:
@@ -36,11 +39,23 @@ class AddonWarning(Warning):
     pass
 
 
+class ConnectionWarning(Warning):
+    pass
+
+
+class AddonError(BaseException):
+    pass
+
+
 class InvalidName(BaseException):
+
+    """Raised when an invalid string is passed of as a nickname."""
     pass
 
 
 class InvalidPrefix(BaseException):
+
+    """Raised when an string with an invalid prefix is passed of as a channel name."""
     pass
 
 
@@ -49,6 +64,8 @@ class InvalidCharacter(BaseException):
 
 
 class ConnectionTimedOut(BaseException):
+
+    """Raised when the connection times out during a blocked Channel.join() or Channel.part() call."""
     pass
 
 
@@ -57,18 +74,26 @@ class ConnectionClosed(BaseException):
 
 
 class RequestTimedOut(BaseException):
+
+    """Raised when a timeout is reached during a blocked Channel.join() or Channel.part() call."""
     pass
 
 
 class NotConnected(BaseException):
+
+    """Raised when attempting to send data to a server when not connected."""
     pass
 
 
 class BannedFromChannel(BaseException):
+
+    """Raised in a blocked Channel.join() call when server returns a 474 reply (Banned from Channel)."""
     pass
 
 
 class RedirectedJoin(BaseException):
+
+    """Raised in a blocked Channel.join() call when server returns a 470 reply (Channel redirect)."""
     pass
 
 
@@ -157,6 +182,7 @@ _prefixmatch = r"\((.*)\)(.*)"
 _defaultchanmodes = u"b,k,l,imnpst".split(",")
 _defaultprefix = ("ov", "@+")
 _defaultchantypes = "&#+!"
+_capmodifiers = "~=-"
 
 _privmodeeventnames = dict(q=("Owner", "Deowner"), a=("Admin", "Deadmin"), o=(
     "Op", "Deop"), h=("Halfop", "Dehalfop"), v=("Voice", "Devoice"))
@@ -177,18 +203,50 @@ def timestamp():
 
 
 class Connection(object):
+    __doc__ = "Manages a connection to an IRC network. Includes support for addons."
     __name__ = "pyIRC"
-    __version__ = "2.0"
+    __version__ = "2.1"
     __author__ = "Brian Sherson"
     __date__ = "February 21, 2014"
 
-    def __init__(self, server, nick="ircbot", username="python", realname="Python IRC Library", passwd=None, port=None, ipvers=(socket.AF_INET6, socket.AF_INET), secure=False, autoreconnect=True, timeout=300, retrysleep=5, maxretries=15, protoctl=("UHNAMES", "NAMESX"), quietpingpong=True, pinginterval=60, addons=None, autostart=False):
+    def __init__(
+        self, server, port=None, ipvers=(socket.AF_INET6, socket.AF_INET), secure=False, passwd=None,
+        nick="ircbot", username="python", realname="Python IRC Library",
+        requestcaps=[], starttls=False, protoctl=[],
+        autoreconnect=True, retrysleep=5, maxretries=15,
+            timeout=300, quietpingpong=True, pinginterval=60, addons=[], autostart=False):
+        """__init__(server[, ...])
+
+        Constructor for the Connection class.
+
+        Arguments:
+
+        server: Server name. Can provide host name or IP address.
+        port: Port to use, or automatically selected if port=None.
+        ipvers: Tuple of IP protocols to try.
+        secure: Use SSL.
+        passwd: Password to be sent with PASS during registration process, or None.
+        nick: A nickname, or list of nicknames.
+        username: Username that is requested with USER command during registration process.
+        realname: Desired GECOS.
+        requestcaps: List of capabilities to request on connect.
+        protoctl: Protocols to request when support is detected in 005 response.
+        autoreconnect: Reconnect automatically when disconnected unexpectedly.
+        retrysleep: Number of seconds to wait between connection attempts.
+        maxretries: Number of connection attempts before giving up, or -1 to try indefinitely.
+        timeout: Read timeout.
+        quietpingpong: Suppress logging and events on PING and PONG events.
+        pinginterval: Amount of time of not receiving data from a server aftr which a ping request is to be sent.
+        addons: List of addons that should be initialized with this instance. Items of this list are either instances of addons or dict objects
+           containing keyword arguments to be used to configure addons.
+        autostart: Automatically start connection to IRC server upon initialization.
+        """
         if port is None or (type(port) == int and 0 < port < 65536):
             self.port = port
         else:
             raise ValueError, "Invalid value for 'port'"
 
-        if re.match(_nickmatch, nick) if (type(nick) in (str, unicode)) else all([re.match(_nickmatch, n) for n in nick]) if (type(nick) in (list, tuple)) else False:
+        if re.match(_nickmatch, nick) if isinstance(nick, (str, unicode)) else all([re.match(_nickmatch, n) for n in nick]) if isinstance(nick, (list, tuple)) else False:
             self.nick = nick
         else:
             raise ValueError, "Invalid value for 'nick'"
@@ -219,17 +277,17 @@ class Connection(object):
         else:
             raise ValueError, "Invalid value for 'autoreconnect'"
 
-        if type(maxretries) in (int, long):
+        if isinstance(maxretries, (int, long)):
             self.maxretries = maxretries
         else:
             raise ValueError, "Invalid value for 'maxretries'"
 
-        if type(timeout) in (int, long):
+        if isinstance(timeout, (int, long)):
             self.timeout = timeout
         else:
             raise ValueError, "Invalid value for 'timeout'"
 
-        if type(retrysleep) in (int, long):
+        if isinstance(retrysleep, (int, long, float)) and retrysleep >= 0:
             self.retrysleep = retrysleep
         else:
             raise ValueError, "Invalid value for 'retrysleep'"
@@ -238,6 +296,19 @@ class Connection(object):
             self.quietpingpong = quietpingpong
         else:
             raise ValueError, "Invalid value for 'quietpingpong'"
+
+        if type(starttls) == bool:
+            if starttls and secure:
+                warnings.warn(
+                    "Cannot use STARTTLS when secure=True", ConnectionWarning)
+            self.starttls = starttls
+        else:
+            raise ValueError, "Invalid value for 'starttls'"
+
+        if isinstance(requestcaps, (list, tuple)):
+            self.requestcaps = list(requestcaps)
+        else:
+            raise ValueError, "Invalid value for 'requestcaps'"
 
         if type(pinginterval) in (int, long):
             self.pinginterval = pinginterval
@@ -260,18 +331,26 @@ class Connection(object):
         self._recvhandlerthread = None
 
         # Initialize IRC environment variables
-        self.users = UserList(context=self)
-        self.channels = ChanList(context=self)
+        self.users = UserList(context=self, withdict=True)
+        self.channels = ChanList(context=self, withdict=True)
+
+        # We are going to try something different, to try to make searching quicker.
+        # self.users={}
+        # self.channels={}
+
+        self.servers = ServerList(context=self)
         self.addons = []
 
-        self.trusted = []  # To be implemented later
         self._init()
-        if type(addons) == list:
-            for addon in addons:
-                if type(addon) == dict:
-                    self.addAddon(**addon)
+        for conf in addons:
+            try:
+                if type(conf) == dict:
+                    self.addAddon(**conf)
                 else:
-                    self.addAddon(addon)
+                    self.addAddon(conf)
+            except:
+                pass
+
         if autostart:
             self.connect()
 
@@ -281,13 +360,10 @@ class Connection(object):
         self._connected = False
         self._registered = False
         self._connection = None
+        self._starttls = False
         self.trynick = 0
 
         self.identity = None
-
-        self.motdgreet = None
-        self.motd = None
-        self.motdend = None
 
         self.serv = None
         self.welcome = None
@@ -298,6 +374,22 @@ class Connection(object):
         self.supports = {}
         self.throttledata = []
         self.throttled = False
+        self.enabledcaps = []
+        self.supportedcaps = []
+        self._requestedcaps = []
+        self._caplsrequested = False
+
+    @property
+    def motdgreet(self):
+        return self.identity.server.motdgreet
+
+    @property
+    def motd(self):
+        return self.identity.server.motd
+
+    @property
+    def motdend(self):
+        return self.identity.server.motdend
 
     @property
     def connected(self):
@@ -308,17 +400,32 @@ class Connection(object):
         return self._registered
 
     def logwrite(self, *lines):
+        """logwrite(*lines)
+
+        Writes one or more line to the log file, signed with a timestamp."""
         with self._loglock:
             ts = timestamp()
             for line in lines:
-                try:
-                    print >>self.log, u"%s %s" % (ts, line)
-                except:
-                    print line
-                    raise
+                print >>self.log, u"%s %s" % (ts, line)
             self.log.flush()
 
+    def logerror(self, *lines):
+        """logerror(*lines)
+
+        Prints lines and traceback sys.stderr and to the log file."""
+        exc, excmsg, tb = sys.exc_info()
+        lines = lines + tuple(traceback.format_exc().split("\n"))
+
+        # Print to log AND stderr
+        self.logwrite(*[u"!!! {line}".format(**vars()) for line in lines])
+        for line in lines:
+            print >>sys.stderr, line
+
     def logopen(self, filename, encoding="utf8"):
+        """logopen(filename[, encoding])
+
+        Sets the log file to 'filename.'"""
+
         with self._loglock:
             ts = timestamp()
             newlog = codecs.open(filename, "a", encoding=encoding)
@@ -335,8 +442,8 @@ class Connection(object):
         handled = []
         unhandled = []
         errors = []
-        for k, addon in enumerate(addons):
-            if addons.index(addon) < k:
+        for k, addon in enumerate(addons + [self]):
+            if addon in addons and addons.index(addon) < k:
                 # Duplicate
                 continue
 
@@ -347,25 +454,20 @@ class Connection(object):
 
             # Iterate through all events.
             for (method, args, fallback) in events:
-                if method in dir(addon) and callable(getattr(addon, method)):
+                try:
                     f = getattr(addon, method)
-                elif fallback and not fellback:
-                    if "onOther" in dir(addon) and callable(addon.onOther) and data:
-                        f = addon.onOther
-                        args = dict(line=line, **data)
-                        fellback = True
-                    elif "onUnhandled" in dir(addon) and callable(addon.onUnhandled) and data:
-                        # Backwards compatability for addons that still use
-                        # onUnhandled. Use onOther in future development.
-                        f = addon.onUnhandled
+                except AttributeError:
+                    if fallback and not fellback and data:
+                        try:
+                            f = getattr(addon, "onOther")
+                        except AttributeError:
+                            unhandled.append(addon)
+                            continue
                         args = dict(line=line, **data)
                         fellback = True
                     else:
                         unhandled.append(addon)
                         continue
-                else:
-                    unhandled.append(addon)
-                    continue
 
                 if type(f) == new.instancemethod:
                     argspec = inspect.getargspec(f.im_func)
@@ -381,26 +483,19 @@ class Connection(object):
                     exc, excmsg, tb = sys.exc_info()
                     errors.append((addon, exc, excmsg, tb))
 
-                    # Print to log AND stderr
-                    tblines = [u"!!! Exception in addon %(addon)s" % vars()]
-                    tblines.append(u"!!! Function: %s" % f)
-                    tblines.append(u"!!! Arguments: %s" % args)
-                    for line in traceback.format_exc().split("\n"):
-                        tblines.append(u"!!! %s" % autodecode(line))
-                    self.logwrite(*tblines)
-                    print >>sys.stderr, "Exception in addon %(addon)s" % vars()
-                    print >>sys.stderr, u"Function: %s" % f
-                    print >>sys.stderr, u"Arguments: %s" % args
-                    print >>sys.stderr, traceback.format_exc()
+                    self.logerror(u"Exception in addon {addon}".format(
+                        **vars()), u"Function: %s" % f, u"Arguments: %s" % args)
+
                     if exceptions:  # If set to true, we raise the exception.
                         raise
                 else:
                     handled.append(addon)
         return (handled, unhandled, errors)
 
-    # TODO: Build method validation into the next two addons, Complain when a method is not callable or does not take in the expected arguments.
-    # Inspects the methods of addon to make sure
     def validateAddon(self, addon):
+        """validateAddon(addon)
+
+        Checks the addon's methods and issues warnings when a method's arguments do not line up with what is expected."""
         supported = self.eventsupports()
         keys = supported.keys()
         for fname in dir(addon):
@@ -443,61 +538,82 @@ class Connection(object):
                         "!!! AddonWarning: Function '%s' does not accept supported arguments: %s" %
                         (func.__name__, ", ".join(unsupported)))
 
-    def addAddon(self, addon, trusted=False, **params):
-        self.validateAddon(addon)
-        for a in self.addons:
-            if (type(a) == Config and a.addon is addon) or a is addon:
-                raise BaseException, "Addon already added."
-        with self.lock:
-            if params:
-                defconf = Config(addon, **params)
-            else:
-                defconf = addon
-            if hasattr(addon, "onAddonAdd") and callable(addon.onAddonAdd):
-                conf = addon.onAddonAdd(self, **params)
-                if conf is not None:
-                    self.addons.append(conf)
-                else:
-                    self.addons.append(defconf)
-            else:
-                self.addons.append(defconf)
-            self.logwrite("*** Addon %s added." % repr(addon))
-            if trusted:
-                self.trusted.append(addon)
+    def addAddon(self, addon, **params):
+        """addAddon(addon[, ...])
 
-    def insertAddon(self, index, addon, trusted=False, **params):
+        Configures and appends addon to self.addons.
+        Additional keyword arguments are passed onto addon.onAddonAdd whenever the method exists."""
         self.validateAddon(addon)
-        for a in self.addons:
-            if (type(a) == Config and a.addon is addon) or a is addon:
-                raise BaseException, "Addon already added."
+
         with self.lock:
-            if params:
-                defconf = Config(addon, **params)
-            else:
-                defconf = addon
-            if hasattr(addon, "onAddonAdd") and callable(addon.onAddonAdd):
-                conf = addon.onAddonAdd(self, **params)
-                if conf is not None:
-                    self.addons.insert(index, conf)
-                else:
-                    self.addons.insert(index, defconf)
-            else:
-                self.addons.insert(index, defconf)
+            addoninstances = [
+                conf.addon if type(conf) == Config else conf for conf in self.addons]
+            if addon in addoninstances:
+                raise AddonError, "Addon already added."
+            conf = self._configureAddon(addon, **params)
+            self.addons.append(conf)
+            self.logwrite("*** Addon %s added." % repr(addon))
+
+    def insertAddon(self, index, addon, **params):
+        """insertAddon(index, addon[, ...])
+
+        The 'list.insert' version of addAddon."""
+        self.validateAddon(addon)
+
+        with self.lock:
+            addoninstances = [
+                conf.addon if type(conf) == Config else conf for conf in self.addons]
+            if addon in addoninstances:
+                raise AddonError, "Addon already added."
+            conf = self._configureAddon(addon, **params)
+            self.addons.insert(index, conf)
             self.logwrite("*** Addon %s inserted into index %d." %
                           (repr(addon), index))
-            if trusted:
-                self.trusted.append(addon)
 
+    # Configures an addon by calling the addon's onAddonAdd instance (if it
+    # exists) and returns the appropriate config object (or just the addon
+    # instance if no config) to put into self.addons
+    def _configureAddon(self, addon, **params):
+        if hasattr(addon, "onAddonAdd") and callable(addon.onAddonAdd):
+            try:
+                conf = addon.onAddonAdd(self, **params)
+            except:
+                self.logerror(
+                    u"An exception has occurred while trying to configure addon {addon}.".format(**vars()))
+                raise
+            if conf is None:
+                return addon
+            return conf
+        elif params:
+            return Config(addon, **params)
+        else:
+            return addon
+
+    # Removes addon from self.addons
     def rmAddon(self, addon):
+        """rmAddon(addon)
+
+        Removes addon from self.addons."""
         with self.lock:
-            self.addons.remove(addon)
+            addoninstances = [
+                conf.addon if type(conf) == Config else conf for conf in self.addons]
+
+            del self.addons[addoninstances.index(addon)]
             self.logwrite("*** Addon %s removed." % repr(addon))
-            if addon in self.trusted:
-                self.trusted.remove(addon)
             if hasattr(addon, "onAddonRem") and callable(addon.onAddonAdd):
-                addon.onAddonRem(self)
+                try:
+                    addon.onAddonRem(self)
+                except:
+                    self.logerror(
+                        u"An exception has occurred while trying to configure addon {addon}.".format(**vars()))
 
     def connect(self, server=None, port=None, secure=None, ipvers=None, forcereconnect=False, blocking=False):
+        """connect([...])
+
+        Starts connection to the IRC server. Optional arguments server, port, secure, and ipvers can be
+        provided to override the current settings.
+        Use 'forcereconnect=True' to quit existing connection if already connected.
+        Use 'blocking=True' to wait until connection is established (or maxretries is exhausted)."""
         if ipvers != None:
             ipvers = ipvers if type(ipvers) == tuple else (ipvers,)
         else:
@@ -527,6 +643,7 @@ class Connection(object):
                     raise NotConnected
 
     def _connect(self, addr, ipver, secure, hostname=None):
+        """Makes a single attempt to connect to server."""
         with self.lock:
             if self._connected:
                 raise AlreadyConnected
@@ -568,17 +685,19 @@ class Connection(object):
             raise
         else:
             # Run onConnect on all addons to signal connection was established.
+            self._connected = True
             with self.lock:
                 self._event(
                     self.getalladdons(), [("onConnect", dict(), False)])
             self.logwrite(
                 "*** Connection to {addrstr} established.".format(**vars()))
             self.addr = addr
-            self._connected = True
             with self._connecting:
                 self._connecting.notifyAll()
 
     def _tryaddrs(self, server, addrs, ipver, secure):
+        """Iterates through addrs until a connection is successful, returning True, or returning False when no connections are made.
+        Raises an exception when it detects Network is unreachable (e.g., IPv6 network is not available)."""
         for addr in addrs:
             try:
                 if server == addr[0]:
@@ -600,6 +719,7 @@ class Connection(object):
         return False
 
     def _tryipver(self, server, port, ipver, secure):
+        """Attempts to resolve 'server' to a one or more IP addresses, then tries to establish a connection."""
         if ipver == socket.AF_INET6:
             self.logwrite(
                 "*** Attempting to resolve {server} to an IPv6 address...".format(**vars()))
@@ -631,6 +751,7 @@ class Connection(object):
         return self._tryaddrs(server, addrs, ipver, secure)
 
     def _tryipvers(self, server, port, ipvers, secure):
+        """Attempts to try a connection for each IP version in ipvers until a connection is successful."""
         for ipver in ipvers:
             try:
                 ret = self._tryipver(server, port, ipver, secure)
@@ -651,6 +772,7 @@ class Connection(object):
         return False
 
     def _procrecvline(self, line):
+        """Called whenever a line of data is received from the IRC server."""
         matches = re.findall(_ircmatch, line)
 
         # We have a match!
@@ -667,26 +789,13 @@ class Connection(object):
                 self.logwrite("<<< %s" % line)
 
             if origin == "" and cmd == "PING":
-                self._send(u"PONG :%s" % extinfo)
+                self.send(u"PONG :%s" % extinfo)
 
             with self.lock:
                 data = dict(origin=origin, cmd=cmd, target=target,
                             targetprefix=None, params=params, extinfo=extinfo)
 
-                if not self._registered:
-                    if type(cmd) == int and cmd != 451 and target != "*":  # Registration complete!
-                        self.identity = self.user(target, init=True)
-                        self.serv = origin
-                        self._event(self.getalladdons(), [
-                                    ("onRegistered", dict(), False)], line, data)
-                        self._registered = True
-
-                    elif cmd == 433 and target == "*":  # Server reports nick taken, so we need to try another.
-                        self._trynick()
-                    if not self._registered:  # Registration is not yet complete
-                        return
-
-                if username and host:
+                if username and host and self._registered:
                     nickname = origin
                     origin = self.user(origin)
                     if origin.nick != nickname:
@@ -698,6 +807,8 @@ class Connection(object):
                     if origin.host != host:
                         # Origin host has changed
                         origin.host = host
+                else:
+                    origin = self.getserver(origin)
 
                 # Check to see if target matches a channel (optionally with
                 # prefix)
@@ -715,7 +826,7 @@ class Connection(object):
 
                 # Check to see if target matches a valid nickname. Do NOT
                 # convert target to User instance if cmd is NICK.
-                elif re.match(_nickmatch, target) and cmd != "NICK":
+                elif re.match(_nickmatch, target) and cmd in ("PRIVMSG", "NOTICE", "MODE", "INVITE", "KILL") and self._registered:
                     targetprefix = ""
                     target = self.user(target)
 
@@ -739,20 +850,13 @@ class Connection(object):
                 if hasattr(self, parsename) and callable(getattr(self, parsename)):
                     parsemethod = getattr(self, parsename)
                     try:
-                        addons, events = parsemethod(
+                        ret = parsemethod(
                             origin, target, targetprefix, params, extinfo)
+                        addons, events = ret if ret is not None else (
+                            self.addons, [])
                     except:
-                        exc, excmsg, tb = sys.exc_info()
-
-                        # Print to log AND stderr
-                        tblines = [
-                            u"!!! There was an error in parsing the following line:", u"!!! %s" % line]
-                        for tbline in traceback.format_exc().split("\n"):
-                            tblines.append(u"!!! %s" % autodecode(tbline))
-                        self.logwrite(*tblines)
-                        print >>sys.stderr, u"There was an error in parsing the following line:"
-                        print >>sys.stderr, u"%s" % line
-                        print >>sys.stderr, traceback.format_exc()
+                        self.logerror(
+                            u"There was an error in parsing the following line:", line)
                         return
                 else:
                     addons = self.addons
@@ -763,19 +867,20 @@ class Connection(object):
                         events = [
                             ("on%s" % cmd.upper(), dict(line=line, origin=origin, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo), True)]
 
-                # Supress pings and pongs if self.quietpingpong is set to True
+                # Suppress pings and pongs if self.quietpingpong is set to True
                 if cmd in ("PING", "PONG") and self.quietpingpong:
                     return
 
                 # Send parsed data to addons having onRecv method first
                 self._event(
-                    addons + [self], [("onRecv", dict(line=line, **data), False)], line, data)
+                    addons, [("onRecv", dict(line=line, **data), False)], line, data)
 
                 # Support for further addon events is taken care of here. We also treat the irc.Connection instance itself as an addon for the purpose of
                 # tracking the IRC state, and should be invoked *last*.
-                self._event(addons + [self], events, line, data)
+                self._event(addons, events, line, data)
 
     def _recvhandler(self, server, port, ipvers, secure):
+        """Function that is run as a separate thread, both managing the connection and handling data coming from the IRC server."""
         if currentThread() != self._recvhandlerthread:  # Enforce that this function must only be run from within self._sendhandlerthread.
             raise RuntimeError, "This function is designed to run in its own thread."
 
@@ -842,12 +947,10 @@ class Connection(object):
                         self._sendline.notify()
 
                     # Attempt initial registration.
-                    nick = self.nick[0]
-                    if self.passwd:
-                        self._send(u"PASS %s" % self.passwd)
-                    self._trynick()
-                    self._send(u"USER %s * * :%s" %
-                               (self.username.split("\n")[0].rstrip(), self.realname.split("\n")[0].rstrip()))
+                    # nick=self.nick[0]
+                    # if self.passwd:
+                        #self.send(u"PASS %s" % self.passwd)
+                    # self._trynick()
 
                     # Initialize buffers
                     linebuf = []
@@ -860,7 +963,7 @@ class Connection(object):
                                 if pingreq and pingreq in self._outgoing:
                                     self._outgoing.remove(pingreq)
                                 pingreq = (time.time() + self.pinginterval, u"PING %s %s" % (
-                                    self.identity.nick if self.identity else "*", self.serv), self)
+                                    (self.identity.nick, self.identity.server) if self.identity else ("*", self.server)), self)
                                 self._outgoing.append(pingreq)
                                 self._sendline.notify()
 
@@ -887,7 +990,7 @@ class Connection(object):
                     exc, excmsg, tb = sys.exc_info()
                     with self.lock:
                         self.logwrite(
-                            "*** Connection to %(server)s:%(port)s failed: %(excmsg)s." % vars())
+                            "*** Connection to {self:uri} failed: {excmsg}.".format(**vars()))
                         self._event(self.getalladdons(), [
                                     ("onConnectFail", dict(exc=exc, excmsg=excmsg, tb=tb), False)])
 
@@ -928,10 +1031,7 @@ class Connection(object):
             pass
 
         except:  # Print exception to log file
-            self.logwrite(*["!!! FATAL Exception"] + ["!!! %s" %
-                          line for line in traceback.format_exc().split("\n")])
-            print >>sys.stderr, "FATAL Exception"
-            print >>sys.stderr, traceback.format_exc()
+            self.logerror(u"FATAL Exception")
             sys.exit()
 
         finally:
@@ -944,8 +1044,19 @@ class Connection(object):
                 self._outgoing.append("quit")
                 self._sendline.notify()
 
-    # Gets a list of *all* addons, including channel-specific addons.
+    def lower(self, s):
+        """lower(s)
+
+        Transforms a string into lowercase, using whatever casemapping the server is using, whether ascii or rfc1459."""
+        if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
+            return s.lower()
+        else:
+            return s.translate(_rfc1459casemapping)
+
     def getalladdons(self):
+        """getalladdons() --> list
+
+        Returns list of *all* addons, including channel-specific addons."""
         return self.addons + reduce(lambda x, y: x + y, [chan.addons for chan in self.channels], [])
 
     # The following methods matching parse* are used to determine what addon methods will be called, and prepares the arguments to be passed.
@@ -959,6 +1070,20 @@ class Connection(object):
     # 'fallback' is a flag to determine when a fallback to 'onOther' is permitted.
     # Each of these functions should allow passing None to all arguments, in
     # which case, should report back *all* supported methods.
+    def parseCAP(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [
+                    ("onCapLS", dict(origin=None, capabilities=None), True),
+                    ("onCapAck", dict(origin=None, capabilities=None), True),
+                    ])
+        if params.upper() == "LS":
+            return (self.getalladdons(), [("onCapLS", dict(capabilities=extinfo.split()), True)])
+        if params.upper() == "ACK":
+            return (self.getalladdons(), [("onCapAck", dict(capabilities=extinfo.split()), True)])
+        return ([], [])
+
     def parse001(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
         return (self.getalladdons(), [("onWelcome", dict(origin=origin, msg=extinfo), True)])
 
@@ -1015,10 +1140,10 @@ class Connection(object):
         return (self.addons, [("onChanCount", dict(origin=origin, chancount=chancount), True)])
 
     def parse305(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Returned from away status
-        return (self.getalladdons(), [("onReturn", dict(origin=origin, msg=extinfo), True)])
+        return (self.getalladdons(), [("onMeReturn", dict(origin=origin, msg=extinfo), True)])
 
     def parse306(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Entered away status
-        return (self.getalladdons(), [("onAway", dict(origin=origin, msg=extinfo), True)])
+        return (self.getalladdons(), [("onMeAway", dict(origin=origin, msg=extinfo), True)])
 
     def parse311(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Start of WHOIS data
         if origin == None:
@@ -1064,6 +1189,7 @@ class Connection(object):
             return (None, [("onWhoisServer", dict(origin=None, user=None, nickname=None, server=None, servername=None), True)])
         nickname, server = params.split(" ")
         user = self.user(nickname)
+        server = self.getserver(server)
         return (self.addons, [("onWhoisServer", dict(origin=origin, user=user, nickname=nickname, server=server, servername=extinfo), True)])
 
     def parse313(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # IRC Op
@@ -1107,7 +1233,7 @@ class Connection(object):
         return (self.addons, [("onWhoisEnd", dict(origin=origin, user=user, nickname=params, msg=extinfo), True)])
 
     def parse321(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Start LIST
-        return (None, [("onListStart", dict(origin=origin, params=params, extinfo=extinfo), True)])
+        return (self.addons, [("onListStart", dict(origin=origin, params=params, extinfo=extinfo), True)])
 
     def parse322(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # LIST item
         if origin == None:
@@ -1119,7 +1245,7 @@ class Connection(object):
             return (self.addons, [("onListEntry", dict(origin=origin, channel=chan, population=int(pop), extinfo=extinfo), True)])
 
     def parse323(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # End of LIST
-        return (None, [("onListEnd", dict(origin=None, endmsg=None), True)])
+        return (self.addons, [("onListEnd", dict(origin=None, endmsg=None), True)])
 
     def parse324(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Modes
         if origin == None:
@@ -1180,6 +1306,7 @@ class Connection(object):
             channel = None
 
         user = self.user(nick)
+        serv = self.getserver(serv)
 
         if type(channel) == Channel:
             return (self.addons + channel.addons, [("onWhoEntry", dict(origin=origin, channel=channel, user=user, channame=channame, username=username, host=host, serv=serv, nick=nick, flags=flags, hops=int(hops), realname=realname), True)])
@@ -1227,6 +1354,53 @@ class Connection(object):
     def parse376(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):
         return (self.addons, [("onMOTDEnd", dict(origin=origin, motdend=extinfo), True)])
 
+    def parseACCOUNT(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+        if origin == None:
+            return (None, [
+                    ("onAccountLogin", dict(user=None, account=None), True),
+                    ("onMeAccountLogin", dict(account=None), False),
+                    ("onAccountLogout", dict(user=None), True),
+                    ("onMeAccountLogout", dict(), False)
+                    ])
+
+        addons = reduce(
+            lambda x, y: x + y, [channel.addons for channel in origin.channels if self.identity in channel.users], [])
+
+        if origin == self.identity:
+            if target == "*":
+                return (self.addons + addons, [
+                        ("onAccountLogout", dict(user=origin), True),
+                        ("onMeAccountLogout", dict(), False)
+                        ])
+            else:
+                return (self.addons + addons, [
+                        ("onAccountLogin", dict(
+                            user=origin, account=target), True),
+                        ("onMeAccountLogin", dict(account=target), False)
+                        ])
+        else:
+            if target == "*":
+                return (self.addons + addons, [("onAccountLogout", dict(user=origin), True)])
+            else:
+                return (self.addons + addons, [("onAccountLogin", dict(user=origin, account=target), True)])
+
+    def parseAWAY(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
+        if outgoing:
+            return ([], [])
+
+        if origin == None:
+            return (None, [("onAway", dict(user=None, awaymsg=None), True), ("onReturn", dict(user=None), True)])
+
+        addons = reduce(
+            lambda x, y: x + y, [channel.addons for channel in origin.channels if self.identity in channel.users], [])
+
+        if extinfo:
+            return (self.addons + addons, [("onAway", dict(user=origin, awaymsg=extinfo), True)])
+        else:
+            return (self.addons + addons, [("onReturn", dict(user=origin), True)])
+
     def parseNICK(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
         if outgoing:
             return ([], [])
@@ -1255,8 +1429,8 @@ class Connection(object):
 
         if origin == None:
             return (None, [
-                    ("onMeJoin", dict(channel=None), False),
-                    ("onJoin", dict(user=None, channel=None), True)
+                    ("onMeJoin", dict(channel=None, loggedinas=None, realname=None), False),
+                    ("onJoin", dict(user=None, channel=None, loggedinas=None, realname=None), True)
                     ])
 
         if type(target) == Channel:
@@ -1265,13 +1439,20 @@ class Connection(object):
             channel = self.channel(extinfo)
             channel.name = extinfo
 
+        if "extended-join" in self.enabledcaps:
+            loggedinas = params if params != "*" else None
+            realname = extinfo
+        else:
+            loggedinas = realname = None
+
         if origin == self.identity:
             return (self.addons + channel.addons, [
-                    ("onMeJoin", dict(channel=channel), False),
-                    ("onJoin", dict(user=origin, channel=channel), True),
+                    ("onMeJoin", dict(channel=channel, loggedinas=loggedinas, realname=realname), False),
+                    ("onJoin", dict(user=origin, channel=channel,
+                     loggedinas=loggedinas, realname=realname), True),
                     ])
 
-        return (self.addons + channel.addons, [("onJoin", dict(user=origin, channel=channel), True)])
+        return (self.addons + channel.addons, [("onJoin", dict(user=origin, channel=channel, loggedinas=loggedinas, realname=realname), True)])
 
     def parseKICK(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
         if outgoing:
@@ -1486,14 +1667,16 @@ class Connection(object):
                     return (self.addons + target.addons, [("onSendChanMsg", dict(origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
         if origin == None:
             return (None, [
-                    ("onPrivMsg", dict(user=None, msg=None), True),
-                    ("onChanMsg", dict(user=None, channel=None, targetprefix=None, msg=None), True),
-                    ("onCTCP", dict(user=None, ctcptype=None, params=None), True),
-                    ("onChanCTCP", dict(user=None, channel=None,
-                     targetprefix=None, ctcptype=None, params=None), True),
-                    ("onPrivAction", dict(user=None, action=None), True),
-                    ("onChanAction", dict(
-                        user=None, channel=None, targetprefix=None, action=None), True),
+                    ("onPrivMsg", dict(user=None, msg=None, identified=None), True),
+                    ("onChanMsg", dict(user=None, channel=None,
+                     targetprefix=None, msg=None, identified=None), True),
+                    ("onCTCP", dict(user=None, ctcptype=None, params=None, identified=None), True),
+                    ("onChanCTCP", dict(user=None, channel=None, targetprefix=None,
+                     ctcptype=None, params=None, identified=None), True),
+                    ("onPrivAction", dict(
+                        user=None, action=None, identified=None), True),
+                    ("onChanAction", dict(user=None, channel=None,
+                     targetprefix=None, action=None, identified=None), True),
                     ("onSendPrivMsg", dict(
                         origin=None, user=None, msg=None), True),
                     ("onSendChanMsg", dict(
@@ -1506,22 +1689,26 @@ class Connection(object):
                     ("onSendChanCTCP", dict(origin=None, channel=None,
                      targetprefix=None, ctcptype=None, params=None), True),
                     ])
+        if "identify-msg" in self.enabledcaps and extinfo[0] in "+-":
+            identified, extinfo = extinfo.startswith("+"), extinfo[1:]
+        else:
+            identified = None
         ctcp = re.findall(_ctcpmatch, extinfo)
         if ctcp:
             (ctcptype, ext) = ctcp[0]
             if target == self.identity:
                 if ctcptype.upper() == "ACTION":
-                    return (self.addons, [("onPrivAction", dict(user=origin, action=ext), True)])
-                return (self.addons, [("onCTCP", dict(user=origin, ctcptype=ctcptype, params=ext), True)])
+                    return (self.addons, [("onPrivAction", dict(user=origin, action=ext, identified=identified), True)])
+                return (self.addons, [("onCTCP", dict(user=origin, ctcptype=ctcptype, params=ext, identified=identified), True)])
             if type(target) == Channel:
                 if ctcptype.upper() == "ACTION":
-                    return (self.addons, [("onChanAction", dict(user=origin, channel=target, targetprefix=targetprefix, action=ext), True)])
-                return (self.addons, [("onChanCTCP", dict(user=origin, channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext), True)])
+                    return (self.addons, [("onChanAction", dict(user=origin, channel=target, targetprefix=targetprefix, action=ext, identified=identified), True)])
+                return (self.addons, [("onChanCTCP", dict(user=origin, channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext, identified=identified), True)])
         else:
             if type(target) == Channel:
-                return (self.addons + target.addons, [("onChanMsg", dict(user=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
+                return (self.addons + target.addons, [("onChanMsg", dict(user=origin, channel=target, targetprefix=targetprefix, msg=extinfo, identified=identified), True)])
             elif target == self.identity:
-                return (self.addons, [("onPrivMsg", dict(user=origin, msg=extinfo), True)])
+                return (self.addons, [("onPrivMsg", dict(user=origin, msg=extinfo, identified=identified), True)])
 
     def parseNOTICE(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None, outgoing=False):
         if outgoing:
@@ -1536,28 +1723,35 @@ class Connection(object):
                     return (self.addons, [("onSendPrivNotice", dict(origin=origin, user=target, msg=extinfo), True)])
         if origin == None:
             return (None, [
-                    ("onPrivNotice", dict(origin=None, msg=None), True),
-                    ("onChanNotice", dict(
-                        origin=None, channel=None, targetprefix=None, msg=None), True),
+                    ("onPrivNotice", dict(
+                        origin=None, msg=None, identified=None), True),
+                    ("onServNotice", dict(
+                        origin=None, msg=None, identified=None), True),
+                    ("onChanNotice", dict(origin=None, channel=None,
+                     targetprefix=None, msg=None, identified=None), True),
                     ("onCTCPReply", dict(
-                        origin=None, ctcptype=None, params=None), True),
+                        origin=None, ctcptype=None, params=None, identified=None), True),
                     ("onSendPrivNotice", dict(origin=None, msg=None), True),
                     ("onSendChanNotice", dict(
                         origin=None, channel=None, targetprefix=None, msg=None), True),
                     ("onSendCTCPReply", dict(
                         origin=None, ctcptype=None, params=None), True),
                     ])
+        if "identify-msg" in self.enabledcaps and extinfo[0] in "+-":
+            identified, extinfo = extinfo.startswith("+"), extinfo[1:]
+        else:
+            identified = None
         ctcp = re.findall(_ctcpmatch, extinfo)
-        # print ctcp
         if ctcp and target == self.identity:
             (ctcptype, ext) = ctcp[0]
-            return (self.addons, [("onCTCPReply", dict(origin=origin, ctcptype=ctcptype, params=ext), True)])
+            return (self.addons, [("onCTCPReply", dict(origin=origin, ctcptype=ctcptype, params=ext, identified=identified), True)])
         else:
+            if type(origin) == Server:
+                return (self.addons, [("onServNotice", dict(origin=origin, msg=extinfo, identified=identified), True)])
             if type(target) == Channel:
-                return (self.addons + target.addons, [("onChanNotice", dict(origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo), True)])
+                return (self.addons + target.addons, [("onChanNotice", dict(origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo, identified=identified), True)])
             elif target == self.identity:
-                # print "onPrivNotice"
-                return (self.addons, [("onPrivNotice", dict(origin=origin, msg=extinfo), True)])
+                return (self.addons, [("onPrivNotice", dict(origin=origin, msg=extinfo, identified=identified), True)])
 
     def parse367(self, origin=None, target=None, targetprefix=None, params=None, extinfo=None):  # Channel Ban list
         if origin == None:
@@ -1652,6 +1846,9 @@ class Connection(object):
         return (self.addons + channel.addons, [("onQuietListEnd", dict(channel=channel, endmsg=extinfo), True)])
 
     def eventsupports(self):
+        """eventsupports() --> {eventname: arguments, ...}
+
+        Generates and returns a dict of supported events and associated arguments. Good for attempting to validate addon events."""
         supports = {}
         for item in dir(self):
             if re.match(r"parse(\d{3}|[A-Z]+)", item):
@@ -1673,7 +1870,100 @@ class Connection(object):
                          })
         return supports
 
+    def _register(self):
+        if self.passwd:
+            self.send(u"PASS %s" % self.passwd)
+        self._trynick()
+        self.send(
+            u"USER {self.username} * * :{self.realname}".format(**vars()))
+
+    def requestcapls(self, origin=None):
+        """requestcapls(...)
+
+        Sends "CAP LS" to the server to request supported capabilities. Please use this method instead of send()."""
+        if not self._caplsrequested:
+            self.send("CAP LS", origin=origin)
+        self._caplsrequested = True
+
     # Here are the builtin event handlers.
+
+    def onRecv(self, context, line, origin, cmd, target, targetprefix, params, extinfo):
+        if not self._registered:
+            if type(cmd) == int and cmd < 100 and target != "*":  # Registration complete!
+                self.identity = self.user(target, init=True)
+                self.identity.server = origin
+                self._event(self.getalladdons(), [
+                            ("onRegistered", dict(), False)])
+
+    def onRegistered(self, context):
+        self._registered = True
+
+    def onConnect(self, context):
+        if self.requestcaps:
+            self.requestcapls()
+        elif self.starttls:
+            self.send("STARTLS")
+        elif len(self._requestedcaps) == 0 and not self._caplsrequested:
+            self._register()
+
+    def onCapLS(self, context, capabilities):
+        self.supportedcaps = capabilities
+        self._caplsrequested = False
+        if self.starttls and "tls" in capabilities and not self.secure and not self._starttls:
+            self.send("STARTTLS")
+        elif not self.registered:
+            requestcaps = [
+                cap for cap in self.requestcaps if cap in capabilities]
+            if requestcaps:
+                self.sendcapsrequest(requestcaps)
+            elif len(self._requestedcaps) == 0:
+                self.send("CAP END")
+                self._register()
+
+    def onCapAck(self, context, capabilities):
+        for cap in capabilities:
+            mods, capname = re.findall(
+                "^([%s]*)(.+)$" % re.escape(_capmodifiers), cap)[0]
+            if "-" in mods and capname in self.enabledcaps:
+                self.enabledcaps.remove(capname)
+            elif cap not in self.enabledcaps:
+                self.enabledcaps.append(capname)
+            if cap in self._requestedcaps:
+                self._requestedcaps.remove(cap)
+        if not self.registered and len(self._requestedcaps) == 0:
+            self.send("CAP END")
+            self._register()
+
+    def onCapNak(self, context, capabilities):
+        for cap in capabilities:
+            mods, capname = re.findall(
+                "^([%s]*)(.+)$" % re.escape(_capmodifiers), cap)[0]
+            if cap in self._requestedcaps:
+                self._requestedcaps.remove(cap)
+        if not self.registered and len(self._requestedcaps) == 0:
+            self.send("CAP END")
+            self._register()
+
+    def on433(self, context, line, origin, target, params, extinfo):
+        if not self._registered:  # Server reports nick taken, so we need to try another.
+            self._trynick()
+
+    def on670(self, context, line, origin, target, params, extinfo):
+        self.logwrite("*** Attempting StartTLS")
+        self._connection = ssl.wrap_socket(
+            self._connection, cert_reqs=ssl.CERT_NONE)  # Server says go ahead with starttls.
+        self._event(self.getalladdons(), [("onStartTLS", dict(), False)])
+
+    def on691(self, context, line, origin, target, params, extinfo):  # STARTTLS Failure
+        self.logwrite("*** StartTLS Failed")
+        if self.requestcaps:
+            self.send("CAP END")
+        self._register()
+
+    def onStartTLS(self, context):
+        self._starttls = True
+        self.onConnect(self)
+
     def onWelcome(self, context, origin, msg):
         self.welcome = msg  # Welcome message
 
@@ -1690,7 +1980,7 @@ class Connection(object):
         protos = u" ".join(
             [proto for proto in self.protoctl if proto in supports.keys()])
         if protos:
-            self._send(u"PROTOCTL {protos}".format(**vars()))
+            self.send(u"PROTOCTL {protos}".format(**vars()))
         self.supports.update(supports)
 
     def onSnoMask(self, context, origin, snomask):  # Snomask
@@ -1712,13 +2002,20 @@ class Connection(object):
     def onChanCount(self, context, origin, chancount):
         self.chancount = chancount
 
-    def onReturn(self, identity, origin, msg):  # Returned from away status
+    def onReturn(self, context, user):  # Returned from away status
+        user.away = False
+        user.awaymsg = None
+
+    def onAway(self, context, user, awaymsg):  # Entered away status
+        user.away = True
+        user.awaymsg = awaymsg
+
+    def onMeReturn(self, context, origin):  # Returned from away status
         self.identity.away = False
         self.identity.awaymsg = None
 
-    def onAway(self, identity, origin, msg):  # Entered away status
+    def onMeAway(self, context, origin, msg):  # Entered away status
         self.identity.away = True
-        self.identity.awaymsg = msg
 
     def onWhoisStart(self, context, origin, user, nickname, username, host, realname):  # Start of WHOIS data
         user.nick = nickname
@@ -1807,14 +2104,14 @@ class Connection(object):
                         channel.modes[mode].append(user)
 
     def onMOTDLine(self, context, origin, motdline):  # MOTD line
-        self.motd.append(motdline)
+        origin.motd.append(motdline)
 
     def onMOTDStart(self, context, origin, motdgreet):  # Begin MOTD
-        self.motdgreet = motdgreet
-        self.motd = []
+        origin.motdgreet = motdgreet
+        origin.motd = []
 
     def onMOTDEnd(self, context, origin, motdend):
-        self.motdend = motdend  # End of MOTD
+        origin.motdend = motdend  # End of MOTD
 
     # elif cmd==386 and "q" in self.supports["PREFIX"][0]: # Channel Owner (Unreal)
         #(channame,owner)=params.split()
@@ -1838,24 +2135,49 @@ class Connection(object):
             #if user not in channel.modes["a"]: channel.modes["a"].append(user)
         # else: channel.modes["a"]=[user]
 
+    # def onNickChange(self, context, user, newnick):
+        # for other in self.users:
+            # if self.supports.get("CASEMAPPING", "rfc1459")=="ascii":
+                # collision=other.nick.lower()==newnick.lower()
+            # else:
+                # collision=other.nick.translate(_rfc1459casemapping)==newnick.translate(_rfc1459casemapping)
+            # if collision:
+                # self.users.remove(other) ### Nick collision, safe to assume this orphaned user is offline, so we shall remove the old instance.
+                # for channel in self.channels:
+                    # If for some odd reason, the old user still appears common channels, then we will remove the user anyway.
+                    # if other in channel.users:
+                        # channel.users.remove(other)
+        # user.nick=newnick
+
     def onNickChange(self, context, user, newnick):
-        for other in self.users:
-            if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
-                collision = other.nick.lower() == newnick.lower()
+        if self.lower(user.nick) == self.lower(newnick):
+            user.nick = newnick
+        else:
+            try:
+                other = self.users[newnick]
+            except KeyError:
+                pass
             else:
-                collision = other.nick.translate(
-                    _rfc1459casemapping) == newnick.translate(_rfc1459casemapping)
-            if collision:
-                self.users.remove(
-                    other)  # Nick collision, safe to assume this orphaned user is offline, so we shall remove the old instance.
                 for channel in self.channels:
                     # If for some odd reason, the old user still appears common
                     # channels, then we will remove the user anyway.
                     if other in channel.users:
                         channel.users.remove(other)
-        user.nick = newnick
+                self.users.remove(other)
+            self.users.remove(user)
+            user.nick = newnick
+            self.users.append(user)
 
-    def onJoin(self, context, user, channel):
+    def onAccountLogin(self, context, user, account):
+        user.loggedinas = account
+
+    def onAccountLogout(self, context, user):
+        user.loggedinas = None
+
+    def onJoin(self, context, user, channel, loggedinas, realname):
+        if "extended-join" in self.enabledcaps:
+            user.loggedinas = loggedinas
+            user.realname = realname
         if channel not in user.channels:
             user.channels.append(channel)
         if user not in channel.users:
@@ -1867,10 +2189,10 @@ class Connection(object):
             if channel._joinrequested:
                 channel._joinreply = "JOIN"
                 channel._joining.notify()
-        self._send(u"MODE %s" % channel.name)
-        self._send(u"WHO %s" % channel.name)
-        self._send(u"MODE %s :%s" %
-                   (channel.name, self.supports.get("CHANMODES", _defaultchanmodes)[0]))
+        self.send(u"MODE %s" % channel.name)
+        self.send(u"WHO %s" % channel.name)
+        self.send(u"MODE %s :%s" %
+                  (channel.name, self.supports.get("CHANMODES", _defaultchanmodes)[0]))
 
     def onKick(self, context, kicker, channel, kicked, kickmsg):
         if channel in kicked.channels:
@@ -2082,10 +2404,19 @@ class Connection(object):
         nick = self.nick[s] if type(self.nick) in (list, tuple) else self.nick
         if q > 0:
             nick = "%s%d" % (nick, q)
-        self._send(u"NICK %s" % nick)
+        self.send(u"NICK %s" % nick)
         self.trynick += 1
 
-    def _send(self, line, origin=None, T=None):
+    def send(self, line, origin=None, T=None):
+        """send(line[, ...])
+
+        Sends 'line' to IRC server. Try to use this method sparingly by using other methods designed to format requests correctly.
+        Supported optional arguments:
+
+        'origin': Used (voluntarily) by addons to identify origin of sent data. Good for helping addons ignore lines they send
+        so as to avoid infinite loops.
+
+        'T': Specifies what time to send the data if not immediately. This method currently throttles PRIVMSGs to avoid floods."""
         with self.lock:
             if not self.connected:
                 raise NotConnected
@@ -2125,6 +2456,7 @@ class Connection(object):
             self._sendline.notify()
 
     def _procsendline(self, line, origin=None):
+        """Function responsible for sending data to the IRC server and calling all applicable event methods."""
         match = re.findall(_ircmatch, line)
         if len(match) == 0:
             return
@@ -2176,31 +2508,6 @@ class Connection(object):
                         elif cscmd[0].upper() not in ("GLIST", "ACCESS", "SASET", "DROP", "SENDPASS", "ALIST", "INFO", "LIST", "LOGOUT", "STATUS", "UPDATE", "GETPASS", "FORBID", "SUSPEND", "UNSUSPEND", "OINFO"):
                             extinfo = "********"
                             line = "%s %s :%s" % (cmd, target, extinfo)
-
-                #ctcp=re.findall(_ctcpmatch, extinfo)
-                # if ctcp:
-                    #(ctcptype,ext)=ctcp[0]
-                    # if ctcptype.upper()=="ACTION":
-                        # if type(target)==Channel:
-                            #self._event("onSendChanAction", self.addons+target.addons, origin=origin, channel=target, targetprefix=targetprefix, action=ext)
-                        # elif type(target)==User:
-                            #self._event("onSendPrivAction", self.addons, origin=origin, user=target, action=ext)
-                    # else:
-                        # if type(target)==Channel:
-                            #self._event("onSendChanCTCP", self.addons+target.addons, origin=origin, channel=target, targetprefix=targetprefix, ctcptype=ctcptype, params=ext)
-                        # elif type(target)==User:
-                            #self._event("onSendPrivCTCP", self.addons, origin=origin, user=target, ctcptype=ctcptype, params=ext)
-                # else:
-                    # if type(target)==Channel:
-                        #self._event("onSendChanMsg", self.addons+target.addons, origin=origin, channel=target, targetprefix=targetprefix, msg=extinfo)
-                    # elif type(target)==User:
-                        #self._event("onSendPrivMsg", self.addons, origin=origin, user=target, msg=extinfo)
-                # elif target.upper()=="CHANSERV":
-                    #msg=extinfo.split(" ")
-                    # if msg[0].upper() in ("IDENTIFY", "REGISTER") and len(msg)>2:
-                        # msg[2]="********"
-                        #extinfo=" ".join(msg)
-                        #line="%s %s :%s"%(cmd, target, extinfo)
             elif cmd.upper() in ("NS", "NICKSERV"):
                 if target.upper() in ("IDENTIFY", "REGISTER"):
                     params = params.split(" ")
@@ -2247,7 +2554,7 @@ class Connection(object):
                     target.name = channame
             # Check to see if target matches a valid nickname. Do NOT convert
             # target to User instance if cmd is NICK.
-            elif re.match(_nickmatch, target) and cmd != "NICK":
+            elif re.match(_nickmatch, target) and cmd in ("PRIVMSG", "NOTICE", "MODE", "INVITE", "CHGHOST", "CHGIDENT", "CHGNAME", "WHOIS", "KILL", "SAMODE", "SETHOST", "WHO"):
                 targetprefix = ""
                 target = self.user(target)
 
@@ -2260,20 +2567,13 @@ class Connection(object):
                 parsemethod = getattr(self, parsename)
                 if callable(parsemethod):
                     try:
-                        addons, events = parsemethod(
+                        ret = parsemethod(
                             origin, target, targetprefix, params, extinfo, outgoing=True)
+                        addons, events = ret if ret is not None else (
+                            self.events, [])
                     except:
-                        exc, excmsg, tb = sys.exc_info()
-
-                        # Print to log AND stderr
-                        tblines = [
-                            u"!!! There was an error in parsing the following line:", u"!!! %s" % line]
-                        for tbline in traceback.format_exc().split("\n"):
-                            tblines.append(u"!!! %s" % autodecode(tbline))
-                        self.logwrite(*tblines)
-                        print >>sys.stderr, u"There was an error in parsing the following line:"
-                        print >>sys.stderr, u"%s" % line
-                        print >>sys.stderr, traceback.format_exc()
+                        self.logerror(
+                            u"There was an error in parsing the following line:", line)
                         return
             else:
                 addons = self.addons
@@ -2288,8 +2588,8 @@ class Connection(object):
 
             if cmd not in ("PING", "PONG") or not self.quietpingpong:  # Supress pings and pongs if self.quietpingpong is set to True
                 self._event(
-                    addons + [self], [("onSend", dict(origin=origin if origin else self, line=line, cmd=cmd, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo), False)], line)
-                self._event(addons + [self], events, line)
+                    addons, [("onSend", dict(origin=origin if origin else self, line=line, cmd=cmd, target=target, targetprefix=targetprefix, params=params, extinfo=extinfo), False)], line)
+                self._event(addons, events, line)
 
             if not (cmd in ("PING", "PONG") and self.quietpingpong):
                 #self._event(self.addons, [("onSend" , dict(origin=origin, line=line, cmd=cmd, target=target, params=params, extinfo=extinfo), False)])
@@ -2347,14 +2647,8 @@ class Connection(object):
             pass
 
         except:
-            tb = traceback.format_exc()
             self._quitexpected = True
-            tblines = [u"!!! FATAL Exception"]
-            for line in traceback.format_exc().split("\n"):
-                tblines.append(u"!!! %s" % autodecode(line))
-            self.logwrite(*tblines)
-            print >>sys.stderr, "FATAL Exception in {self}".format(**vars())
-            print >>sys.stderr, tb
+            self.logerror("FATAL Exception in {self}".format(**vars()))
             with self._sendline:
                 try:
                     self._connection.send(
@@ -2366,14 +2660,12 @@ class Connection(object):
             with self._sendline:
                 self._outgoing.clear()  # Clear out _outgoing.
 
-    # For compatibility, when modules still expect irc.Connection to be a
-    # subclass of threading.Thread
     def isAlive(self):
+        """For compatibility, when modules still expect irc.Connection to be a subclass of threading.Thread."""
         return type(self._recvhandlerthread) == Thread and self._recvhandlerthread.isAlive() and type(self._sendhandlerthread) == Thread and self._sendhandlerthread.isAlive()
 
-    # For compatibility, when modules still expect irc.Connection to be a
-    # subclass of threading.Thread
     def start(self):
+        """For compatibility, when modules still expect irc.Connection to be a subclass of threading.Thread."""
         return self.connect()
 
     def __repr__(self):
@@ -2394,51 +2686,86 @@ class Connection(object):
                 return "irc{ssl}{proto}://[{self.server}]:{port}".format(**locals())
             else:
                 return "irc{ssl}{proto}://{self.server}:{port}".format(**locals())
+        else:
+            return repr(self)
 
     def oper(self, name, passwd, origin=None):
+        """oper(name, passwd[, origin])
+
+        Sends an OPER request to the server. Warning: Invalid oper credentials may be reported to IRC network admins!"""
         if re.match(".*[\n\r\\s]", name) or re.match(".*[\n\r\\s]", passwd):
             raise InvalidCharacter
-        self._send(u"OPER {name} {passwd}".format(**vars()), origin=origin)
+        self.send(u"OPER {name} {passwd}".format(**vars()), origin=origin)
 
     def list(self, params="", origin=None):
+        """list(...)
+
+        Sends a LIST request to the server.
+        TODO: Implement optional blocking."""
         if re.match(".*[\n\r\\s]", params):
             raise InvalidCharacter
         if params:
-            self._send(u"LIST {params}".format(**vars()), origin=origin)
+            self.send(u"LIST {params}".format(**vars()), origin=origin)
         else:
-            self._send(u"LIST", origin=origin)
+            self.send(u"LIST", origin=origin)
 
-    def getmotd(self, target="", origin=None):
-        if re.match(".*[\n\r\\s]", name) or re.match(".*[\n\r\\s]", passwd):
-            raise InvalidCharacter
-        if len(re.findall("^([^\r\n\\s]*)", target)[0]):
-            self._send(u"MOTD %s" %
-                       (re.findall("^([^\r\n\\s]*)", target)[0]), origin=origin)
+    def getmotd(self, server=None, origin=None):
+        """getmotd(...)
+
+        Sends an MOTD request to the server, optionally specifying server.
+        TODO: Implement optional blocking."""
+        if server:
+            self.send(u"MOTD %s" % server.name, origin=origin)
         else:
-            self._send(u"MOTD", origin=origin)
+            self.send(u"MOTD", origin=origin)
 
-    def version(self, target="", origin=None):
-        if len(re.findall("^([^\r\n\\s]*)", target)[0]):
-            self._send(u"VERSION %s" %
-                       (re.findall("^([^\r\n\\s]*)", target)[0]), origin=origin)
+    def version(self, server=None, origin=None):
+        """version(...)
+
+        Sends an VERSION request to the server, optionally specifying server.
+        This is NOT the same as requesting CTCP version from another user.
+        TODO: Implement optional blocking."""
+        if server:
+            self.send(u"VERSION %s" % server.name, origin=origin)
         else:
-            self._send(u"VERSION", origin=origin)
+            self.send(u"VERSION", origin=origin)
 
-    def stats(self, query, target="", origin=None):
-        if len(re.findall("^([^\r\n\\s]*)", target)[0]):
-            self._send(u"STATS %s %s" %
-                       (query, re.findall("^([^\r\n\\s]*)", target)[0]), origin=origin)
+    def stats(self, query, server=None, origin=None):
+        """stats(query[,...])
+
+        Sends an STATS request to the server, optionally specifying server.
+        STATS requests may be logged by IRC network admins. Use responsibly!
+        TODO: Implement optional blocking."""
+        if server:
+            self.send(u"STATS %s %s" % (query, server.name), origin=origin)
         else:
-            self._send(u"STATS %s" % query, origin=origin)
+            self.send(u"STATS %s" % query, origin=origin)
 
-    # Quit IRC session gracefully
+    def sendcapsrequest(self, capabilities, origin=None):
+        """sendcapsrequest(capabilities)
+
+        Request capabilities with "CAP REQ". Please use this method instead of using send(...)."""
+        with self.lock:
+            for cap in capabilities:
+                if cap not in self._requestedcaps:
+                    self._requestedcaps.append(cap)
+                    self.send("CAP REQ {cap}".format(**vars()), origin=origin)
+
     def quit(self, msg="", origin=None, blocking=False):
+        """quit(...)
+
+        Quit IRC session gracefully by first sending a QUIT request to the server.
+
+        Optional arguments:
+        'msg': Quit message
+        'origin': See help on method 'send'
+        'blocking': Wait until connection is terminated."""
         if "\r" in msg or "\n" in msg:
             raise InvalidCharacter
         if msg:
-            self._send(u"QUIT :%s" % msg, origin=origin)
+            self.send(u"QUIT :%s" % msg, origin=origin)
         else:
-            self._send(u"QUIT", origin=origin)
+            self.send(u"QUIT", origin=origin)
         if blocking:
             with self._disconnecting:
                 while self.connected:
@@ -2446,13 +2773,19 @@ class Connection(object):
                 self._recvhandlerthread.join()
                 self._sendhandlerthread.join()
 
-    # Force disconnect -- Not even sending QUIT to server.
     def disconnect(self):
+        """disconnect()
+
+        Force disconnect -- Goes right for the jugular, not even sending QUIT to server."""
         with self.lock:
             self._quitexpected = True
             self._connection.shutdown(2)
 
     def ctcpversion(self):
+        """ctcpversion() --> string
+
+        Formats a CTCP version reply from this instance and all attached addons."""
+
         reply = []
         # Prepare reply for this module
         reply.append(
@@ -2478,58 +2811,72 @@ class Connection(object):
         return u"; ".join(reply)
 
     def raw(self, line, origin=None):
-        self._send(line, origin=origin)
+        """raw(line[, origin])
+
+        Deprecated. Use send() instead."""
+        self.send(line, origin=origin)
 
     def user(self, nick, init=False):
-        if type(nick) == str:
-            nick = autodecode(nick)
-        if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
-            users = [
-                user for user in self.users if user.nick.lower() == nick.lower()]
-        else:
-            users = [user for user in self.users if user.nick.translate(
-                _rfc1459casemapping) == nick.translate(_rfc1459casemapping)]
-        if len(users):
-            if init:
-                users[0]._init()
-            return users[0]
-        else:
-            user = User(nick, self)
-            self.users.append(user)
-            timestamp = reduce(lambda x, y: x + ":" + y, [
-                               str(t).rjust(2, "0") for t in time.localtime()[0:6]])
-            return user
+        """user(nick)
+
+        Return a User object associated with a nickname.
+        Specify init=True to reset all that is known about user."""
+        with self.lock:
+            try:
+                return self.users[nick]
+            except KeyError:
+                user = User(nick, self)
+                self.users.append(user)
+                return user
 
     def channel(self, name, init=False):
-        if type(name) == str:
-            name = autodecode(name)
-        if self.supports.get("CASEMAPPING", "rfc1459") == "ascii":
-            channels = [
-                chan for chan in self.channels if chan.name.lower() == name.lower()]
-        else:
-            channels = [chan for chan in self.channels if chan.name.translate(
-                _rfc1459casemapping) == name.translate(_rfc1459casemapping)]
-        if len(channels):
-            if init:
-                channels[0]._init()
-            return channels[0]
-        else:
-            timestamp = reduce(lambda x, y: x + ":" + y, [
-                               str(t).rjust(2, "0") for t in time.localtime()[0:6]])
-            chan = Channel(name, self)
-            self.channels.append(chan)
-            return chan
+        """channel(name)
+
+        Return a Channel object associated with a channel name.
+        Specify init=True to reset all that is known about the channel."""
+        with self.lock:
+            try:
+                return self.channels[name]
+            except KeyError:
+                channel = Channel(name, self)
+                self.channels.append(channel)
+                return channel
+
+    def getserver(self, name, init=False):
+        """server(name)
+
+        Return a Server object associated with a server  name.
+        Specify init=True to reset all that is known about the server."""
+        with self.lock:
+            if type(name) == str:
+                name = autodecode(name)
+            servers = [server for server in self.servers if self.lower(
+                server.name) == self.lower(name)]
+
+            if len(servers):
+                if init:
+                    servers[0]._init()
+                return servers[0]
+            else:
+                server = Server(name, self)
+                self.servers.append(server)
+                return server
 
     def __getitem__(self, item):
         chantypes = self.supports.get("CHANTYPES", _defaultchantypes)
+        if "\r" in item or "\n" in item or " " in item:
+            raise InvalidCharacter
         if re.match(_chanmatch % re.escape(chantypes), item):
             return self.channel(item)
         elif re.match(_usermatch, item):
             return self.user(item)
         else:
-            raise TypeError, "String argument does not match valid channel name or nick name."
+            return self.getserver(item)
 
     def fmtsupports(self):
+        """fmtsupports() --> list
+
+        Formats a valid 005 response from known information."""
         supports = [
             "CHANMODES=%s" % (",".join(value)) if name == "CHANMODES" else "PREFIX=(%s)%s" %
             value if name == "PREFIX" else "%s=%s" % (name, value) if value else name for name, value in self.supports.items()]
@@ -2548,7 +2895,9 @@ class Connection(object):
         return lines
 
     def fmtgreeting(self):
-        # Prepare greeting (Responses 001 through 004)
+        """fmtgreeting() --> list
+
+        Formats a valid greeting from known information (Responses 001 through 004)."""
         lines = []
         if self.welcome:
             lines.append(
@@ -2565,14 +2914,21 @@ class Connection(object):
         return lines
 
     def fmtusermodes(self):
-        # Prepars 221 response
+        """fmtusermodes() --> list
+
+        Formats a valid user modes reply from known information (Response 221)."""
         return u":{self.serv} 221 {self.identity.nick} +{self.identity.modes}".format(**vars())
 
     def fmtsnomasks(self):
-        # Prepare 008 response
+        """fmtsnomasks() --> list
+
+        Formats a valid snomasks reply from known information (Response 008)."""
         return u":{self.serv} 008 {self.identity.nick} +{self.identity.snomask} :Server notice mask".format(**vars())
 
     def fmtmotd(self):
+        """fmtmotd() --> list
+
+        Formats a valid MOTD reply from known information (Response 375, 372, and 376; Response 422 if no MOTD)."""
         if self.motdgreet and self.motd and self.motdend:
             lines = []
             lines.append(
@@ -2606,7 +2962,7 @@ class Channel(object):
         self._partreply = None
 
     def _init(self):
-        for user in self.context.users:
+        for user in self.context.users._dict.values():
             if self in user.channels:
                 user.channels.remove(self)
         self.addons = []
@@ -2622,19 +2978,19 @@ class Channel(object):
         if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
             raise InvalidPrefix
         for line in re.findall("([^\r\n]+)", msg):
-            self.context._send(u"PRIVMSG %s%s :%s" %
-                               (target, self.name, line), origin=origin)
+            self.context.send(u"PRIVMSG %s%s :%s" %
+                              (target, self.name, line), origin=origin)
 
     def who(self, origin=None, blocking=False):
         # Send WHO request to server
-        self.context._send(u"WHO %s" % (self.name), origin=origin)
+        self.context.send(u"WHO %s" % (self.name), origin=origin)
 
     def fmtwho(self):
         # Create WHO reply from current data. TODO
         pass
 
     def names(self, origin=None):
-        self.context._send(u"NAMES %s" % (self.name), origin=origin)
+        self.context.send(u"NAMES %s" % (self.name), origin=origin)
 
     def fmtnames(self, sort=None, uhnames=False, namesx=False):
         # Create NAMES reply from current data.
@@ -2646,9 +3002,9 @@ class Channel(object):
         users = list(self.users)
         if sort == "mode":
             users.sort(key=lambda user: ([user not in self.modes.get(mode, [])
-                       for mode, char in zip(*self.context.supports.get("PREFIX", ("ohv", "@%+")))], user.nick.lower()))
+                       for mode, char in zip(*self.context.supports.get("PREFIX", ("ohv", "@%+")))], self.context.lower(user.nick)))
         elif sort == "nick":
-            users.sort(key=lambda user: user.nick.lower())
+            users.sort(key=lambda user: self.context.lower(user.nick))
         if uhnames:
             template = u"{prefixes}{user:full}"
         else:
@@ -2715,12 +3071,12 @@ class Channel(object):
         if target and target not in self.context.supports.get("PREFIX", ("ohv", "@%+"))[1]:
             raise InvalidPrefix
         for line in re.findall("([^\r\n]+)", msg):
-            self.context._send(u"NOTICE %s%s :%s" %
-                               (target, self.name, line), origin=origin)
+            self.context.send(u"NOTICE %s%s :%s" %
+                              (target, self.name, line), origin=origin)
 
     def settopic(self, msg, origin=None):
-        self.context._send(u"TOPIC %s :%s" %
-                           (self.name, re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
+        self.context.send(u"TOPIC %s :%s" %
+                          (self.name, re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
 
     def ctcp(self, act, msg="", origin=None):
         if len(re.findall("^([^\r\n]*)", msg)[0]):
@@ -2750,10 +3106,10 @@ class Channel(object):
                     raise ActionAlreadyRequested
                 self._partrequested = True
                 if len(re.findall("^([^\r\n]*)", msg)[0]):
-                    self.context._send(
+                    self.context.send(
                         u"PART %s :%s" % (self.name, re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
                 else:
-                    self.context._send(u"PART %s" % self.name, origin=origin)
+                    self.context.send(u"PART %s" % self.name, origin=origin)
 
                 # Anticipated Numeric Replies:
 
@@ -2783,8 +3139,8 @@ class Channel(object):
             user) == User else re.findall("^([^\r\n\\s]*)", user)[0]
         if nickname == "":
             raise InvalidName
-        self.context._send(u"INVITE %s %s" %
-                           (nickname, self.name), origin=origin)
+        self.context.send(u"INVITE %s %s" %
+                          (nickname, self.name), origin=origin)
 
     def join(self, key="", blocking=False, timeout=30, origin=None):
         with self.context.lock:
@@ -2799,10 +3155,10 @@ class Channel(object):
                     raise ActionAlreadyRequested
                 self._joinrequested = True
                 if len(re.findall("^([^\r\n\\s]*)", key)[0]):
-                    self.context._send(
+                    self.context.send(
                         u"JOIN %s %s" % (self.name, re.findall("^([^\r\n\\s]*)", key)[0]), origin=origin)
                 else:
-                    self.context._send(u"JOIN %s" % self.name, origin=origin)
+                    self.context.send(u"JOIN %s" % self.name, origin=origin)
 
                 # Anticipated Numeric Replies:
 
@@ -2836,11 +3192,11 @@ class Channel(object):
         if nickname == "":
             raise InvalidName
         if len(re.findall("^([^\r\n]*)", msg)[0]):
-            self.context._send(u"KICK %s %s :%s" %
-                               (self.name, nickname, re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
+            self.context.send(u"KICK %s %s :%s" %
+                              (self.name, nickname, re.findall("^([^\r\n]*)", msg)[0]), origin=origin)
         else:
-            self.context._send(u"KICK %s %s" %
-                               (self.name, nickname), origin=origin)
+            self.context.send(u"KICK %s %s" %
+                              (self.name, nickname), origin=origin)
 
     def __repr__(self):
         return u"<Channel: {self.name} on {self.context:uri}>".format(**vars())
@@ -2878,6 +3234,7 @@ class User(object):
         self.signontime = None
         self.secure = None
         self.away = None
+        self.loggedinas = None
 
     def __repr__(self):
         return (u"<User: %(nick)s!%(username)s@%(host)s>" % vars(self)).encode("utf8")
@@ -2890,13 +3247,13 @@ class User(object):
 
     def msg(self, msg, origin=None):
         for line in re.findall("([^\r\n]+)", msg):
-            self.context._send(u"PRIVMSG %s :%s" %
-                               (self.nick, line), origin=origin)
+            self.context.send(u"PRIVMSG %s :%s" %
+                              (self.nick, line), origin=origin)
 
     def notice(self, msg, origin=None):
         for line in re.findall("([^\r\n]+)", msg):
-            self.context._send(u"NOTICE %s :%s" %
-                               (self.nick, line), origin=origin)
+            self.context.send(u"NOTICE %s :%s" %
+                              (self.nick, line), origin=origin)
 
     def ctcp(self, act, msg="", origin=None):
         if len(re.findall("^([^\r\n]*)", msg)[0]):
@@ -2967,7 +3324,8 @@ class Config(object):
 
 class ChanList(list):
 
-    def __init__(self, iterable=None, context=None):
+    def __init__(self, iterable=None, context=None, withdict=False):
+        self._dict = {} if withdict else None
         if context != None and type(context) != Connection:
             raise TypeError, "context must be irc.Connection object or None"
         self.context = context
@@ -2976,18 +3334,30 @@ class ChanList(list):
             for channel in iterable:
                 if type(channel) == Channel:
                     chanlist.append(channel)
+                    if context and channel.context != context:
+                        raise ValueError, "Channel object does not belong to context."
                 elif type(channel) in (str, unicode):
                     if context == None:
                         raise ValueError, "No context given for string object."
                     chanlist.append(context.channel(channel))
             list.__init__(self, chanlist)
+            if self._dict is not None:
+                if self.context:
+                    self._dict.update(
+                        {self.context.lower(channel.name): channel for channel in chanlist})
+                else:
+                    self._dict.update(
+                        {(channel.context, channel.context.lower(channel.name)): channel for channel in chanlist})
         else:
             list.__init__(self)
 
     def append(self, item):
         if type(item) in (str, unicode):
             if self.context:
-                list.append(self, self.context.channel(item))
+                channel = self.context.channel(item)
+                list.append(self, channel)
+                if self._dict is not None:
+                    self._dict[self.context.lower(item)] = channel
                 return
             else:
                 raise ValueError, "No context given for string object."
@@ -2996,11 +3366,19 @@ class ChanList(list):
         if self.context and item.context != self.context:
             raise ValueError, "Channel object does not belong to context."
         list.append(self, item)
+        if self._dict is not None:
+            if self.context:
+                self._dict[self.context.lower(item.name)] = item
+            else:
+                self._dict[item.context, item.context.lower(item.name)] = item
 
     def insert(self, index, item):
         if type(item) in (str, unicode):
             if self.context:
-                list.insert(self, index, self.context.channel(item))
+                channel = self.context.channel(item)
+                list.insert(self, index, channel)
+                if self._dict is not None:
+                    self._dict[self.context.lower(item)] = channel
                 return
             else:
                 raise ValueError, "No context given for string object."
@@ -3009,53 +3387,74 @@ class ChanList(list):
         if self.context and item.context != self.context:
             raise ValueError, "Channel object does not belong to context."
         list.insert(self, index, item)
+        if self._dict is not None:
+            if self.context:
+                self._dict[self.context.lower(item.name)] = item
+            else:
+                self._dict[item.context, item.context.lower(item.name)] = item
 
     def extend(self, iterable):
-        chanlist = []
-        for item in iterable:
-            if type(item) in (str, unicode):
-                if self.context:
-                    chanlist.append(self.context.channel(item))
-                    return
-                else:
-                    raise ValueError, "No context given for string object."
-            if type(item) != Channel:
-                raise TypeError, "Only channel objects are permitted in list"
-            if self.context and item.context != self.context:
-                raise ValueError, "Channel object does not belong to context."
-            chanlist.append(item)
-        list.extend(self, chanlist)
+        list.extend(self, ChanList(iterable, context=self.context))
 
     def join(self, origin=None):
         if not self.context:
             raise ValueError, "No context defined."
         if any([channel.key for channel in self]):
-            self.context._send(u"JOIN %s %s" %
-                               (self, ",".join([channel.key if channel.key else "" for channel in self])), origin=origin)
+            self.context.send(u"JOIN %s %s" %
+                              (self, ",".join([channel.key if channel.key else "" for channel in self])), origin=origin)
         else:
-            self.context._send(u"JOIN %s" % self, origin=origin)
+            self.context.send(u"JOIN %s" % self, origin=origin)
 
     def part(self, partmsg=None, origin=None):
         if not self.context:
             raise ValueError, "No context defined."
         if partmsg:
-            self.context._send(u"PART %s :%s" %
-                               (",".join([channel.name for channel in self]), partmsg), origin=origin)
+            self.context.send(u"PART %s :%s" %
+                              (",".join([channel.name for channel in self]), partmsg), origin=origin)
         else:
-            self.context._send(u"PART %s" % self, origin=origin)
+            self.context.send(u"PART %s" % self, origin=origin)
 
     def msg(self, msg, origin=None):
         if not self.context:
             raise ValueError, "No context defined."
-        self.context._send(u"PRIVMSG %s :%s" % (self, msg), origin=origin)
+        self.context.send(u"PRIVMSG %s :%s" % (self, msg), origin=origin)
 
     def __str__(self):
         return ",".join([channel.name for channel in self])
 
+    def __getitem__(self, key):
+        if type(key) in (int, long):
+            return list.__getitem__(self, key)
+        else:
+            if self._dict is not None:
+                if self.context == None:
+                    raise ValueError, "No context given for string object."
+                keylower = self.context.lower(key)
+                return self._dict[keylower]
+            else:
+                raise ValueError, "No dict available."
+
+    def __delitem__(self, key):
+        if type(key) in (int, long):
+            channel = self[key]
+            del self._dict[self.context.lower(channel.name)]
+            list.__delitem__(self, channel)
+        else:
+            if self._dict is not None:
+                if self.context == None:
+                    raise ValueError, "No context given for string object."
+                keylower = self.context.lower(key)
+                list.__delitem__(self, self._dict[keylower])
+                del self._dict[keylower]
+            else:
+                raise ValueError, "No dict available."
+
 
 class UserList(list):
+    __doc__ = "Subclass of list, with builtin validation."
 
-    def __init__(self, iterable=None, context=None):
+    def __init__(self, iterable=None, context=None, withdict=False):
+        self._dict = {} if withdict else None
         if context != None and type(context) != Connection:
             raise TypeError, "context must be irc.Connection object or None"
         self.context = context
@@ -3063,19 +3462,35 @@ class UserList(list):
             userlist = []
             for user in iterable:
                 if type(user) == User:
+                    if context and user.context != context:
+                        raise ValueError, "User object does not belong to context."
                     userlist.append(user)
                 elif type(user) in (str, unicode):
                     if context == None:
                         raise ValueError, "No context given for string object."
                     userlist.append(context.user(user))
             list.__init__(self, userlist)
+            if self._dict is not None:
+                if self.context:
+                    self._dict.update(
+                        {self.context.lower(user.nick): user for user in userlist})
+                else:
+                    self._dict.update(
+                        {(user.context, user.context.lower(user.nick)): user for user in userlist})
         else:
             list.__init__(self)
 
     def append(self, item):
+        """append(item)
+
+        Like list.append, but enforces that the appended item must be a User instance.
+        If item is a string, then a User instance will be appended in its place."""
         if type(item) in (str, unicode):
             if self.context:
-                list.append(self, self.context.user(item))
+                user = self.context.user(item)
+                list.append(self, user)
+                if self._dict is not None:
+                    self._dict[self.context.lower(item)] = user
                 return
             else:
                 raise ValueError, "No context given for string object."
@@ -3084,11 +3499,22 @@ class UserList(list):
         if self.context and item.context != self.context:
             raise ValueError, "User object does not belong to context."
         list.append(self, item)
+        if self._dict is not None:
+            if self.context:
+                self._dict[self.context.lower(item.nick)] = item
+            else:
+                self._dict[item.context, item.context.lower(item.nick)] = item
 
     def insert(self, index, item):
+        """insert(index, item)
+
+        Like list.insert."""
         if type(item) in (str, unicode):
             if self.context:
-                list.insert(self, index, self.context.user(item))
+                user = self.context.user(item)
+                list.insert(self, index, user)
+                if self._dict is not None:
+                    self._dict[self.context.lower(item)] = user
                 return
             else:
                 raise ValueError, "No context given for string object."
@@ -3097,30 +3523,65 @@ class UserList(list):
         if self.context and item.context != self.context:
             raise ValueError, "User object does not belong to context."
         list.insert(self, index, item)
+        if self._dict is not None:
+            if self.context:
+                self._dict[self.context.lower(item.nick)] = item
+            else:
+                self._dict[item.context, item.context.lower(item.nick)] = item
 
     def extend(self, iterable):
-        userlist = []
-        for item in iterable:
-            if type(item) in (str, unicode):
-                if self.context:
-                    userlist.append(self.context.user(item))
-                    return
-                else:
-                    raise ValueError, "No context given for string object."
-            if type(item) != User:
-                raise TypeError, "Only user objects are permitted in list"
-            if self.context and item.context != self.context:
-                raise ValueError, "User object does not belong to context."
-            userlist.append(item)
-        list.extend(self, userlist)
+        """extend(iterable)
+
+        Like list.extend."""
+        list.extend(self, UserList(iterable, context=self.context))
 
     def msg(self, msg, origin=None):
+        """msg(msg[, origin])
+
+        Sends a PRIVMSG to all users on list."""
         if not self.context:
             raise ValueError, "No context defined."
-        self.context._send(u"PRIVMSG %s :%s" % (self, msg), origin=origin)
+        self.context.send(u"PRIVMSG %s :%s" % (self, msg), origin=origin)
 
     def __str__(self):
         return ",".join([user.nick for user in self])
+
+    def __getitem__(self, index):
+        if type(index) in (int, long):
+            return list.__getitem__(self, index)
+        else:
+            if self._dict is not None:
+                if self.context == None:
+                    raise ValueError, "No context given for string object."
+                return self._dict[self.context.lower(index)]
+            else:
+                raise ValueError, "No dict available."
+
+    def __delitem__(self, index):
+        if type(index) in (int, long):
+            user = self[index]
+            del self._dict[self.context.lower(user.name)]
+            list.__delitem__(self, user)
+        else:
+            if self._dict is not None:
+                if self.context == None:
+                    raise ValueError, "No context given for string object."
+                index = self.context.lower(index)
+                list.__delitem__(self, self._dict[index])
+                del self._dict[index]
+            else:
+                raise ValueError, "No dict available."
+
+    def remove(self, item):
+        if type(item) == User:
+            list.remove(self, item)
+            if self._dict is not None:
+                if self.context:
+                    del self._dict[self.context.lower(item.nick)]
+                else:
+                    del self._dict[item.context, item.context.lower(item.nick)]
+        else:
+            self.remove(self[item])
 
 
 class Server(object):
@@ -3138,3 +3599,90 @@ class Server(object):
         self.motdgreet = None
         self.motd = []
         self.motdend = None
+
+    def stats(self, query, origin=None):
+        self.context(query, self, origin=origin)
+
+    def __repr__(self):
+        return u"<Server: {self.name} on {self.context:uri}>".format(**vars())
+
+    def __str__(self):
+        return self.name
+
+
+class ServerList(list):
+    __doc__ = "Subclass of list, with builtin validation."
+
+    def __init__(self, iterable=None, context=None):
+        if context != None and type(context) != Connection:
+            raise TypeError, "context must be irc.Connection object or None"
+        self.context = context
+        if iterable:
+            serverlist = []
+            for server in iterable:
+                if type(server) == Server:
+                    if self.context and server.context != self.context:
+                        raise ValueError, "Server object does not belong to context."
+                    serverlist.append(server)
+                elif type(server) in (str, unicode):
+                    if context == None:
+                        raise ValueError, "No context given for string object."
+                    serverlist.append(context.getserver(server))
+            list.__init__(self, serverlist)
+        else:
+            list.__init__(self)
+
+    def append(self, item):
+        """append(item)
+
+        Like list.append, but enforces that the appended item must be a Server instance.
+        If item is a string, then a Server instance will be appended in its place."""
+        if type(item) in (str, unicode):
+            if self.context:
+                list.append(self, self.context.getserver(item))
+                return
+            else:
+                raise ValueError, "No context given for string object."
+        if type(item) != Server:
+            raise TypeError, "Only Server objects are permitted in list"
+        if self.context and item.context != self.context:
+            raise ValueError, "Server object does not belong to context."
+        list.append(self, item)
+
+    def insert(self, index, item):
+        """insert(index, item)
+
+        Like list.insert."""
+        if type(item) in (str, unicode):
+            if self.context:
+                list.insert(self, index, self.context.getserver(item))
+                return
+            else:
+                raise ValueError, "No context given for string object."
+        if type(item) != Server:
+            raise TypeError, "Only Server objects are permitted in list"
+        if self.context and item.context != self.context:
+            raise ValueError, "Server object does not belong to context."
+        list.insert(self, index, item)
+
+    def extend(self, iterable):
+        """extend(iterable)
+
+        Like list.extend."""
+        serverlist = []
+        for item in iterable:
+            if type(item) in (str, unicode):
+                if self.context:
+                    serverlist.append(self.context.getserver(item))
+                    return
+                else:
+                    raise ValueError, "No context given for string object."
+            if type(item) != User:
+                raise TypeError, "Only Server objects are permitted in list"
+            if self.context and item.context != self.context:
+                raise ValueError, "Server object does not belong to context."
+            serverlist.append(item)
+        list.extend(self, serverlist)
+
+    def __str__(self):
+        return ",".join([user.nick for user in self])

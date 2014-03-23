@@ -24,9 +24,9 @@ def LoggerReload(log):
     with newlog.rotatelock, log.rotatelock:
         newlog.logs = log.logs
         log.logs = {}
-    for context, label in log.labels.items():
+    for context, conf in log.conf.items():
         context.rmAddon(log)
-        context.addAddon(newlog, label=label)
+        context.addAddon(newlog, label=conf.label)
     return newlog
 
 
@@ -34,7 +34,7 @@ class Logger(Thread):
 
     def __init__(self, logroot):
         self.logroot = logroot
-        path = [logroot]
+        path = [os.path.expanduser(logroot)]
 
         while not os.path.isdir(path[0]):
             split = os.path.split(path[0])
@@ -48,7 +48,7 @@ class Logger(Thread):
             os.mkdir(path[0])
 
         self.logs = {}
-        self.labels = {}
+        self.conf = {}
         self.rotatelock = Lock()
 
         Thread.__init__(self)
@@ -66,7 +66,9 @@ class Logger(Thread):
                     if all([not log or log.closed for log in self.logs.values()]):
                         break
                 Y, M, D, h, m, s, w, d, dst = now = time.localtime()
-                for context in self.labels.keys():
+
+                logroot = os.path.expanduser(self.logroot)
+                for context in self.conf.keys():
                     if context.connected:
                         with context.lock:
                             try:
@@ -92,20 +94,27 @@ class Logger(Thread):
                                             context.logwrite(*["!!! [Logger] Exception in module %(module)s" % vars()] + [
                                                              "!!! [Logger] %s" % tbline for tbline in traceback.format_exc().split("\n")])
                             context.logopen(
-                                os.path.join(self.logroot, self.labels[context], "rawdata-%04d.%02d.%02d.log" % now[:3]))
+                                os.path.join(logroot, self.conf[context].label, "rawdata-%04d.%02d.%02d.log" % now[:3]))
                 nextrotate = int(time.mktime((Y, M, D + 1, 0, 0, 0, 0, 0, -1)))
         finally:
             Thread.__init__(self)
             self.daemon = True
 
     def onAddonAdd(self, context, label):
-        if label in self.labels.values():
-            raise BaseException, "Label already exists"
-        if context in self.labels.keys():
-            raise BaseException, "Network already exists"
-        if not os.path.isdir(os.path.join(self.logroot, label)):
-            os.mkdir(os.path.join(self.logroot, label))
-        self.labels[context] = label
+        logroot = os.path.expanduser(self.logroot)
+
+        for (context2, conf2) in self.conf.items():
+            if context == context2:
+                raise ValueError, "Context already exists in config."
+            if label == conf2.label:
+                raise ValueError, "Unique label required."
+
+        conf = irc.Config(self, label=label)
+
+        contextroot = os.path.join(logroot, label)
+        if not os.path.isdir(contextroot):
+            os.mkdir(contextroot)
+
         if context.connected:
             self.openLog(context)
             if context.identity:
@@ -115,7 +124,9 @@ class Logger(Thread):
         timestamp = reduce(lambda x, y: x + ":" + y, [
                            str(t).rjust(2, "0") for t in now[0:6]])
         context.logopen(
-            os.path.join(self.logroot, self.labels[context], "rawdata-%04d.%02d.%02d.log" % now[:3]))
+            os.path.join(contextroot, "rawdata-%04d.%02d.%02d.log" % now[:3]))
+        self.conf[context] = conf
+        return conf
 
     def onAddonRem(self, context):
         if context.connected:
@@ -129,9 +140,11 @@ class Logger(Thread):
                         self.closeLog(user)
             if context in self.logs.keys() and not self.logs[context].closed:
                 self.closeLog(context)
-        del self.labels[context]
+        del self.conf[context]
 
     def openLog(self, window):
+        logroot = os.path.expanduser(self.logroot)
+
         with self.rotatelock:
             if not self.isAlive():
                 self.start()
@@ -145,12 +158,12 @@ class Logger(Thread):
                            str(t).rjust(2, "0") for t in now[0:6]])
         if type(window) == irc.Connection:
             log = self.logs[window] = codecs.open(
-                os.path.join(self.logroot, self.labels[window], "console-%04d.%02d.%02d.log" % now[:3]), "a", encoding="utf8")
+                os.path.join(logroot, self.conf[window].label, "console-%04d.%02d.%02d.log" % now[:3]), "a", encoding="utf8")
             print >>log, "%s ### Log file opened" % (irc.timestamp())
 
         elif type(window) == irc.Channel:
-            label = self.labels[window.context]
-            log = self.logs[window] = codecs.open(os.path.join(self.logroot, label, "channel-%s-%04d.%02d.%02d.log" % (
+            label = self.conf[window.context].label
+            log = self.logs[window] = codecs.open(os.path.join(logroot, label, "channel-%s-%04d.%02d.%02d.log" % (
                 (urllib2.quote(window.name.lower().decode("utf8")).replace("/", "%2f"),) + now[:3])), "a", encoding="utf8")
             print >>log, "%s ### Log file opened" % (irc.timestamp())
             self.logs[window].flush()
@@ -169,8 +182,10 @@ class Logger(Thread):
                         irc.timestamp(), window.fmtchancreated())
 
         if type(window) == irc.User:
-            logname = os.path.join(self.logroot, self.labels[window.context], "query-%s-%04d.%02d.%02d.log" % (
-                (urllib2.quote(window.nick.lower()).replace("/", "%2f"),) + now[:3]))
+            label = self.conf[window.context].label
+            logname = os.path.join(
+                logroot, label, "query-%s-%04d.%02d.%02d.log" %
+                ((urllib2.quote(window.nick.lower()).replace("/", "%2f"),) + now[:3]))
             for (other, log) in self.logs.items():
                 if other == window:
                     continue

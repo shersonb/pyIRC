@@ -351,7 +351,7 @@ class ModJSONDecoder(json.JSONDecoder):
         return obj, end
 
 
-class JSONEncoder(object):
+class ModJSONEncoder(object):
 
     """Extensible JSON <http://json.org> encoder for Python data structures.
 
@@ -478,7 +478,49 @@ class JSONEncoder(object):
                         return JSONEncoder.default(self, o)
 
         """
-        if path:
+        if "json" in dir(o) and callable(o.json):
+            conf = o.json()
+
+        else:
+            conf = collections.OrderedDict()
+            conf["class"] = "{o.__class__.__module__}.{o.__class__.__name__}".format(
+                **vars())
+
+            if "__init__" in dir(o) and type(o.__init__) == new.instancemethod:
+                try:
+                    arginspect = inspect.getargspec(o.__init__)
+                except:
+                    raise TypeError(repr(o) + " is not JSON serializable")
+
+                if arginspect.defaults:
+                    requiredargs = arginspect.args[
+                        1:len(arginspect.args) - len(arginspect.defaults)]
+                    argswithdefaults = arginspect.args[
+                        len(arginspect.args) - len(arginspect.defaults):]
+                    defaultvalues = arginspect.defaults
+                else:
+                    requiredargs = arginspect.args[1:]
+                    argswithdefaults = []
+                    defaultvalues = []
+
+                for key in requiredargs:
+                    try:
+                        conf[key] = getattr(o, key)
+                    except AttributeError:
+                        print key
+                        print refs.keys()
+                        raise TypeError(
+                            repr(o) + " is not JSON serializable (Cannot recover required argument '%s')" % key)
+
+                for key, default in zip(argswithdefaults, defaultvalues):
+                    try:
+                        value = getattr(o, key)
+                        if value != default:
+                            conf[key] = getattr(o, key)
+                    except AttributeError:
+                        pass
+
+        if path and not isinstance(conf, (int, long, bool, basestring)) and conf is not None:
             pathstr = str(path[0])
             numindices = []
             for index in path[1:]:
@@ -494,45 +536,7 @@ class JSONEncoder(object):
                 numindices = []
             if pathstr not in refs.keys():
                 refs[pathstr] = o
-        if "json" in dir(o) and callable(o.json):
-            return o.json()
 
-        conf = collections.OrderedDict()
-        conf["class"] = "{o.__class__.__module__}.{o.__class__.__name__}".format(
-            **vars())
-
-        if "__init__" in dir(o) and type(o.__init__) == new.instancemethod:
-            try:
-                arginspect = inspect.getargspec(o.__init__)
-            except:
-                raise TypeError(repr(o) + " is not JSON serializable")
-
-            if arginspect.defaults:
-                requiredargs = arginspect.args[
-                    1:len(arginspect.args) - len(arginspect.defaults)]
-                argswithdefaults = arginspect.args[
-                    len(arginspect.args) - len(arginspect.defaults):]
-                defaultvalues = arginspect.defaults
-            else:
-                requiredargs = arginspect.args[1:]
-                argswithdefaults = []
-                defaultvalues = []
-
-            for key in requiredargs:
-                try:
-                    conf[key] = getattr(o, key)
-                except AttributeError:
-                    print key
-                    raise TypeError(
-                        repr(o) + " is not JSON serializable (Cannot recover required argument '%s')" % key)
-
-            for key, default in zip(argswithdefaults, defaultvalues):
-                try:
-                    value = getattr(o, key)
-                    if value != default:
-                        conf[key] = getattr(o, key)
-                except AttributeError:
-                    pass
         return conf
 
     def encode(self, o):
@@ -630,10 +634,10 @@ class JSONEncoder(object):
                 o, _current_indent_level, markers, refs, path)
             if ref:
                 yield ref
-            elif isinstance(o, (list, tuple)):
+            elif isinstance(o, (list, tuple)) and "json" not in dir(o):
                 for chunk in self._iterencode_list(o, _current_indent_level, markers, refs, path):
                     yield chunk
-            elif isinstance(o, dict):
+            elif isinstance(o, dict) and "json" not in dir(o):
                 for chunk in self._iterencode_dict(o, _current_indent_level, markers, refs, path):
                     yield chunk
             else:
@@ -714,10 +718,10 @@ class JSONEncoder(object):
                     yield buf + ref
                 else:
                     yield buf
-                    if isinstance(value, (list, tuple)):
+                    if isinstance(value, (list, tuple)) and "json" not in dir(value):
                         chunks = self._iterencode_list(
                             value, _current_indent_level, markers, refs, path + (k,))
-                    elif isinstance(value, dict):
+                    elif isinstance(value, dict) and "json" not in dir(value):
                         chunks = self._iterencode_dict(
                             value, _current_indent_level, markers, refs, path + (k,))
                     else:
@@ -816,10 +820,10 @@ class JSONEncoder(object):
                 if ref:
                     yield ref
                 else:
-                    if isinstance(value, (list, tuple)):
+                    if isinstance(value, (list, tuple)) and "json" not in dir(value):
                         chunks = self._iterencode_list(
                             value, _current_indent_level, markers, refs, path + (key,))
-                    elif isinstance(value, dict):
+                    elif isinstance(value, dict) and "json" not in dir(value):
                         chunks = self._iterencode_dict(
                             value, _current_indent_level, markers, refs, path + (key,))
                     else:

@@ -14,6 +14,10 @@ from threading import Thread
 from threading import RLock as Lock
 import Queue
 import chardet
+import modjson
+
+dec = modjson.ModJSONDecoder()
+enc = modjson.ModJSONEncoder(indent=3)
 
 # TODO: Rewrite this *entire* module and make more efficient.
 
@@ -26,21 +30,14 @@ _listnumerics = dict(b=(367, 368, "channel ban list"),
 
 
 def BouncerReload(BNC):
+    networks, configs = zip(*BNC.conf.items())
+    json = enc.encode([BNC, configs])
     if BNC.isAlive():
         BNC.stop()
-    if BNC.__version__ == "1.3":
-        newBNC = Bouncer(
-            addr=BNC.addr, port=BNC.port, secure=BNC.ssl, ipv6=BNC.ipv6,
-            certfile=BNC.certfile, keyfile=BNC.keyfile, timeout=BNC.timeout, autoaway=BNC.autoaway)
-        for label, (context, passwd, hashtype) in BNC.servers.items():
-            context.rmAddon(BNC)
-            context.addAddon(
-                newBNC, label=label, passwd=passwd, hashtype=hashtype)
-    else:
-        newBNC = Bouncer(**BNC.__options__)
-        for context, conf in BNC.conf.items():
-            context.rmAddon(BNC)
-            context.addAddon(newBNC, **conf.__dict__)
+    newBNC, newconfs = dec.decode(json)
+    for network, newconf in zip(networks, newconfs):
+        network.rmAddon(BNC)
+        network.addAddon(**newconf)
     return newBNC
 
 
@@ -56,7 +53,7 @@ class Bouncer (Thread):
         self.conf = {}
         self.passwd = {}
         self.socket = None
-        self.ssl = ssl
+        self.secure = secure
         self.ipv6 = ipv6
         self.certfile = certfile
         self.keyfile = keyfile
@@ -119,7 +116,7 @@ class Bouncer (Thread):
         Thread.__init__(self)
         self.daemon = True
 
-    def onAddonAdd(self, context, label, passwd=None, hashtype="sha512", ignore=None, autoaway=None, translations=None, hidden=None):
+    def onAddonAdd(self, context, label, passwd=None, hashtype="sha512", ignore=None, autoaway=None, translations=[], hidden=[]):
         for (context2, conf2) in self.conf.items():
             if context == context2:
                 raise ValueError, "Context already exists in config."
@@ -132,9 +129,8 @@ class Bouncer (Thread):
                     break
                 print "Passwords do not match!"
             passwd = hashlib.new(hashtype, passwd).hexdigest()
-        conf = irc.Config(
-            self, label=label, passwd=passwd, hashtype=hashtype, ignore=ignore, autoaway=autoaway,
-            translations={} if translations == None else translations, hidden=irc.ChanList(hidden, context=context))
+        conf = irc.Config(self, label=label, passwd=passwd, hashtype=hashtype, ignore=ignore, autoaway=autoaway, translations=[
+                          (key if type(key) == irc.Channel else context[key], value) for key, value in translations], hidden=irc.ChanList(hidden, context=context))
         self.conf[context] = conf
         self._whoexpected[context] = []
         if self.debug:
@@ -262,11 +258,11 @@ class Bouncer (Thread):
 
     def onWhoEntry(self, context, origin, channel, user, channame, username, host, serv, nick, flags, hops, realname):
         # Called when a WHO list is received.
-        conf = self.conf[context]
-        if len(self._whoexpected[context]) and self._whoexpected[context][0] in self.clients:
+        if len(self._whoexpected[context]):
             client = self._whoexpected[context][0]
-            client.send(origin=origin, cmd=352, target=context.identity, params=u"{channame} {username} {host} {serv} {nick} {flags}".format(
-                **vars()), extinfo=u"{hops} {realname}".format(**vars()))
+            if client in self.clients:
+                client.send(origin=origin, cmd=352, target=context.identity, params=u"{channame} {username} {host} {serv} {nick} {flags}".format(
+                    **vars()), extinfo=u"{hops} {realname}".format(**vars()))
                 # client.send(":%s 352 %s %s %s %s %s %s %s :%s %s\n"%(origin, context.identity.nick, channame, username, host, serv, nick, flags, hops, realname))
 
     def onWhoEnd(self, context, origin, param, endmsg):
@@ -301,15 +297,10 @@ class Bouncer (Thread):
 
     def onListEntry(self, context, origin, channel, population, extinfo):
         # Called when a WHO list is received.
-        conf = self.conf[context]
-        if channel in conf.translations.keys():
-            channame = conf.translations[channel]
-        else:
-            channame = channel.name
         if len(self._listexpected[context]) and self._listexpected[context][0] in self.clients:
             client = self._listexpected[context][0]
             client.send(origin=origin, cmd=322, target=context.identity,
-                        params=u"{channame} {population}".format(**vars()), extinfo=extinfo)
+                        params=u"{channel.name} {population}".format(**vars()), extinfo=extinfo)
                 # client.send(":%s 322 %s %s %d :%s\n"%(origin, context.identity.nick, channame, population, extinfo))
 
     def onListEnd(self, context, origin, endmsg):
@@ -424,7 +415,7 @@ class Bouncer (Thread):
         self.broadcast(context, origin=user, cmd="JOIN", target=channel, clients=[
                        client for client in self.clients if channel not in client.hidden])
 
-    def onUnhandled(self, context, line, origin, cmd, target, params, extinfo, targetprefix):
+    def onOther(self, context, line, origin, cmd, target, params, extinfo, targetprefix):
         conf = self.conf[context]
         self.broadcast(
             context, origin=origin, cmd=cmd, target=target, params=params, extinfo=extinfo,
@@ -482,26 +473,26 @@ class BouncerConnection (Thread):
         if type(target) == irc.Channel:
             if targetprefix == None:
                 targetprefix = ""
-            if target in self.translations.keys():
-                target = targetprefix + self.translations[target]
-            else:
-                target = targetprefix + target.name
+            # if target in self.translations.keys():
+            #	target=targetprefix+self.translations[target]
+            # else:
+            #	target=targetprefix+target.name
+            target = targetprefix + target.name
         elif type(target) == irc.User:
             target = target.nick
 
         if type(cmd) == int:
             cmd = "%03d" % cmd
 
-        translated = []
-        if params:
-            for param in params.split(" "):
-                chantypes = self.context.supports.get(
-                    "CHANTYPES", irc._defaultchantypes)
-                if re.match(irc._chanmatch % re.escape(chantypes), param) and self.context[param] in self.translations.keys():
-                    translated.append(self.translations[self.context[param]])
-                else:
-                    translated.append(param)
-        params = " ".join(translated)
+        # translated=[]
+        # if params:
+            # for param in params.split(" "):
+                #chantypes=self.context.supports.get("CHANTYPES", irc._defaultchantypes)
+                # if re.match(irc._chanmatch % re.escape(chantypes), param) and self.context[param] in self.translations.keys():
+                    # translated.append(self.translations[self.context[param]])
+                # else:
+                    # translated.append(param)
+        #params=" ".join(translated)
 
         if params:
             line = u"{cmd} {target} {params}".format(**vars())
@@ -841,7 +832,7 @@ class BouncerConnection (Thread):
                                 self.context.logwrite(
                                     "*** [BouncerConnection] Incoming connection from %s to %s denied: Invalid password." % (self.host, self.context))
                                 self.bouncer.broadcast(
-                                    self.context, origin=self.bouncer.servname, cmd="NOTICE", target=client.context.identity,
+                                    self.context, origin=self.bouncer.servname, cmd="NOTICE", target=self.context.identity,
                                     extinfo="Incoming connection from %s to %s denied: Invalid password." % (self.host, self.context))
                                 # for client in self.bouncer.clients:
                                         # if client.context!=self.context:
@@ -899,7 +890,8 @@ class BouncerConnection (Thread):
                 else:
                     chantypes = self.context.supports.get(
                         "CHANTYPES", irc._defaultchantypes)
-                    if cmd.upper() not in ("SETTRANSLATE", "RMTRANSLATE"):
+                    # Disable translating for now.
+                    if False and cmd.upper() not in ("SETTRANSLATE", "RMTRANSLATE"):
                         translated = []
                         for targ in target.split(","):
                             translatefound = False
@@ -1104,7 +1096,7 @@ class BouncerConnection (Thread):
     def cmdSHOW(self, line, target, params, extinfo):
         chantypes = self.context.supports.get(
             "CHANTYPES", irc._defaultchantypes)
-        with self.lock:
+        with self.context.lock, self.lock:
             for channame in target.split():
                 if re.match(irc._chanmatch % re.escape(chantypes), channame):
                     channel = self.context[channame]
@@ -1128,7 +1120,7 @@ class BouncerConnection (Thread):
     def cmdHIDE(self, line, target, params, extinfo):
         chantypes = self.context.supports.get(
             "CHANTYPES", irc._defaultchantypes)
-        with self.lock:
+        with self.context.lock, self.lock:
             for channame in target.split():
                 if re.match(irc._chanmatch % re.escape(chantypes), channame):
                     channel = self.context[channame]
@@ -1153,7 +1145,7 @@ class BouncerConnection (Thread):
     def cmdSETTRANSLATE(self, line, target, params, extinfo):
         chantypes = self.context.supports.get(
             "CHANTYPES", irc._defaultchantypes)
-        with self.lock:
+        with self.context.lock, self.lock:
             if re.match(irc._chanmatch % re.escape(chantypes), target) and re.match(irc._chanmatch % re.escape(chantypes), target):
                 channel = self.context[target]
                 if self.context.supports.get("CASEMAPPING", "rfc1459") == "ascii":
@@ -1177,7 +1169,7 @@ class BouncerConnection (Thread):
     def cmdRMTRANSLATE(self, line, target, params, extinfo):
         chantypes = self.context.supports.get(
             "CHANTYPES", irc._defaultchantypes)
-        with self.lock:
+        with self.context.lock, self.lock:
             if re.match(irc._chanmatch % re.escape(chantypes), target):
                 channel = self.context[target]
                 if channel not in self.translations.keys():
