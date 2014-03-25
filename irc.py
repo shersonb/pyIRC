@@ -2458,7 +2458,7 @@ class Connection(object):
                     if len(self.throttledata) == 0 or self.throttledata[-1] < T - 2:
                         self.throttled = False
                     else:
-                        T = max(T, self.throttledata[-1] + 1)
+                        T = max(T, self.throttledata[-1] + 0.125)
                 self.throttledata.append(T)
         with self._sendline:
             self._outgoing.append((T, line, origin))
