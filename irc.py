@@ -18,6 +18,7 @@ import new
 import inspect
 import warnings
 import random
+import data
 
 __all__ = ["Connection", "Channel", "ChanList",
            "User", "UserList", "Config", "timestamp"]
@@ -355,6 +356,7 @@ class Connection(object):
             self.connect()
 
     def _init(self):
+        self.data = data.Data(self)
         self.ipver = None
         self.addr = None
         self._connected = False
@@ -436,6 +438,9 @@ class Connection(object):
             self.log = newlog
             print >>self.log, "%s ### Log file opened" % (ts)
             self.log.flush()
+
+    def fireEvent(self, events):
+        self._event(self.getalladdons(), events)
 
     # Used to call event handlers on all attached addons, when applicable.
     def _event(self, addons, events, line=None, data=None, exceptions=False):
