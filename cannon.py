@@ -6,20 +6,23 @@ import os
 
 class Cannon(object):
 
-    def __init__(self):
-        self.firecount = {}
+    def onAddonAdd(self, context, **kwargs):
+        if not getattr(context.data, "cannon", None):
+            context.data.cannon = dict()
 
     def onChanMsg(self, context, user, channel, targetprefix, msg):
+        firecount = context.data.cannon
+
         matches = re.findall("^!fire\\s+(.*)$", msg)
         if matches:
             nickname = matches[0]
             if any([nickname.lower() == usr.nick.lower() for usr in channel.users]):
                 vic = context.user(nickname)
-                if vic in self.firecount.keys():
-                    count = self.firecount[vic] + 1
+                if vic in firecount.keys():
+                    count = firecount[vic] + 1
                 else:
                     count = 1
-                self.firecount[vic] = count
+                firecount[vic] = count
                 if 10 <= count % 100 < 20:
                     ordinal = "th"
                 elif count % 10 == 1:
