@@ -193,6 +193,9 @@ _maskmodeeventnames = dict(b=("Ban", "Unban"), e=(
 exceptcodes = {489: SSLOnly, 384: Cbaned, 403: NoSuchChannel, 405: TooManyChannels, 442: NotOnChannel, 470: RedirectedJoin, 471: ChannelFull, 473: InviteOnly, 474:
                BannedFromChannel, 475: BadChannelKey, 476: BadChannelMask, 520: OpersOnly, 437: Unavailable, 477: RegistrationRequired, 495: RejoinDelay, 530: OperCreateOnly}
 
+_lock = Lock()
+_networks = {}
+
 
 def timestamp():
     t = time.time()
@@ -214,7 +217,7 @@ class Connection(object):
         self, server, port=None, ipvers=(socket.AF_INET6, socket.AF_INET), secure=False, passwd=None,
         nick="ircbot", username="python", realname="Python IRC Library",
         requestcaps=[], starttls=False, protoctl=[],
-        autoreconnect=True, retrysleep=5, maxretries=15,
+        autoreconnect=True, retrysleep=5, maxretries=15, label=None,
             timeout=300, quietpingpong=True, pinginterval=60, addons=[], autostart=False):
         """__init__(server[, ...])
 
@@ -342,6 +345,9 @@ class Connection(object):
         self.servers = ServerList(context=self)
         self.addons = []
 
+        self._label = None
+        self.label = label
+
         self._init()
         for conf in addons:
             try:
@@ -380,6 +386,31 @@ class Connection(object):
         self.supportedcaps = []
         self._requestedcaps = []
         self._caplsrequested = False
+
+    @property
+    def label(self):
+        with self.lock, _lock:
+            return self._label
+
+    @label.setter
+    def label(self, label):
+        with self.lock, _lock:
+            if label == self._label:
+                return ### What's the point?
+            if label is None and self._label in _networks.keys():
+                self._event(self.getalladdons(), [
+                            ("onLabelRemove", dict(newlabel=label), False)])
+                del _networks[self._label]
+                self._label = label
+                return
+            if label in _networks.keys():
+                raise KeyError, "Label already exists!"
+            self._event(self.getalladdons(), [
+                        ("onLabelChange", dict(newlabel=label), False)])
+            if self._label in _networks.keys():
+                del _networks[self._label]
+            _networks[label] = self
+            self._label = label
 
     @property
     def motdgreet(self):
@@ -1872,6 +1903,8 @@ class Connection(object):
                          "onUnhandled": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
                          "onRecv": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
                          "onSend": ("line", "origin", "cmd", "target", "targetprefix", "params", "extinfo"),
+                         "onLabelChange": (label,),
+                         "onLabelRemove": (),
                          })
         return supports
 

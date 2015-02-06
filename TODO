@@ -1,0 +1,4 @@
+* Rework how Connection objects point to addons and addon configs.
+* Fix throttling (so we don't get booted from freenode when joining over 9000 channels upon connect.
+* Allow for addons to provide additional attributes and methods for Connection, Channel, User, and Server objects.
+* Rewrite a parser factory factory, move rfc1459, rfc2812, ircv3, and ircd-specific support into separate modules.
