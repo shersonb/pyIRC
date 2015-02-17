@@ -31,8 +31,13 @@ def autodecode(s):
         # Attempt to figure encoding
         detected = chardet.detect(s)
         try:
-            return s.decode(detected['encoding'])
+            if detected['encoding'] is not None:
+                return s.decode(detected['encoding'])
+            else:
+                return s.decode("utf8", "replace")
         except UnicodeDecodeError:
+            return s.decode("utf8", "replace")
+        except LookupError:
             return s.decode("utf8", "replace")
 
 
